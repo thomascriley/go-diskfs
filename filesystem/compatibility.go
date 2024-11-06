@@ -90,7 +90,7 @@ func (f *fsCompatible) Open(name string) (fs.File, error) {
 	if stat.IsDir() {
 		return &fsDirWrapper{name: name, compat: f, stat: stat}, nil
 	}
-	file, err := f.fs.OpenFile(name, os.O_RDONLY)
+	file, err := f.fs.OpenFile(name, os.O_RDONLY, 0777)
 	if err != nil {
 		return nil, err
 	}

@@ -85,7 +85,7 @@ func tableFromBytes(b []byte) (*Table, error) {
 
 	ptUUID := readPartitionTableUUID(b)
 	parts := make([]*Partition, 0, partitionEntriesCount)
-	count := int(partitionEntriesCount)
+	count := partitionEntriesCount
 	for i := 0; i < count; i++ {
 		// write the primary partition entry
 		start := partitionEntriesStart + i*partitionEntrySize

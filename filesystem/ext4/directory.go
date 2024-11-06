@@ -1,95 +1,113 @@
 package ext4
 
-import (
-	"bytes"
-	"encoding/binary"
-	"fmt"
-)
-
+/*
 const (
 	directoryHashTreeRootMinSize = 0x28
 	directoryHashTreeNodeMinSize = 0x12
 )
+*/
 
 // Directory represents a single directory in an ext4 filesystem
 type Directory struct {
 	directoryEntry
 	root    bool
-	entries []*directoryEntry
+	entries directoryEntries
+}
+
+/*
+type directoryBase struct {
+	directoryEntry
+	root bool
 }
 
 // toBytes convert our entries to raw bytes. Provides checksum as well. Final returned byte slice will be a multiple of bytesPerBlock.
-func (d *Directory) toBytes(bytesPerBlock uint32, checksumFunc checksumAppender) []byte {
+// TODO: check is the parent directory is hashed and serialize as such if necessary
+// https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout#Hash_Tree_Directories
+func (d *Directory) toBytes(bytesPerBlock uint32, checksumEnabled, isHashTree bool, numExtents int, checksumFunc checksumAppender) []byte {
+	if isHashTree {
+		return d.toHashTreeBytes(bytesPerBlock, checksumEnabled, checksumFunc)
+	} else {
+		return d.toLinearBytes(bytesPerBlock, checksumEnabled, checksumFunc)
+	}
+}
+
+func (d *Directory) toLinearBytes(bytesPerBlock uint32, checksumEnabled bool, checksumFunc checksumAppender) []byte {
 	b := make([]byte, 0)
 	var (
-		previousLength int
-		previousEntry  *directoryEntry
-		lastEntryCount int
-		block          []byte
+		index      uint32
+		needed     uint32
+		available  uint32
+		footerSize = uint32(minDirEntryLength)
+		block      = make([]byte, bytesPerBlock)
+		zeros      = make([]byte, bytesPerBlock)
 	)
-	if len(d.entries) == 0 {
-		return b
-	}
-	lastEntryCount = len(d.entries) - 1
-	for i, de := range d.entries {
-		b2 := de.toBytes(0)
-		switch {
-		case len(block)+len(b2) > int(bytesPerBlock)-minDirEntryLength:
-			// if adding this one will go past the end of the block, pad out the previous
-			block = block[:len(block)-previousLength]
-			previousB := previousEntry.toBytes(uint16(int(bytesPerBlock) - len(block) - minDirEntryLength))
-			block = append(block, previousB...)
-			// add the checksum
-			block = checksumFunc(block)
+	for _, de := range d.entries {
+		needed = uint32(de.Size())
+		available = bytesPerBlock - index - footerSize
+
+		// if adding this one will go past the end of the block, zero out the remaining bytes in the block and add the
+		// fake checksum directory entry to the end of the leaf block
+		if needed > available {
+			copy(block[index:bytesPerBlock-footerSize], zeros[:available])
+			if checksumEnabled {
+				checksumFunc(block)
+			}
+			b = slices.Grow(b, 4096)
 			b = append(b, block...)
-			// start a new block
-			block = make([]byte, 0)
-		case i == lastEntryCount:
-			// if this is the last one, pad it out
-			b2 = de.toBytes(uint16(int(bytesPerBlock) - len(block) - minDirEntryLength))
-			block = append(block, b2...)
-			// add the checksum
-			block = checksumFunc(block)
-			b = append(b, block...)
-			// start a new block
-			block = make([]byte, 0)
-		default:
-			block = append(block, b2...)
+			index = 0
 		}
-		previousLength = len(b2)
-		previousEntry = de
+
+		_ = de.MarshalExt4(block[index : index+needed])
+		index += needed
 	}
-	remainder := len(b) % int(bytesPerBlock)
-	if remainder > 0 {
-		extra := int(bytesPerBlock) - remainder
-		zeroes := make([]byte, extra)
-		b = append(b, zeroes...)
+	if index > 0 {
+		b = slices.Grow(b, 4096)
+		b = append(b, block[:index]...)
+		b = append(b, zeros[:bytesPerBlock-index]...)
+		if checksumEnabled {
+			checksumFunc(b[len(b)-int(bytesPerBlock):])
+		}
 	}
 	return b
 }
 
-type directoryHashEntry struct {
-	hash  uint32
-	block uint32
-}
+// toHashTreeBytes
+// as defined in https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout#Hash_Tree_Directories
+func (d *Directory) toHashTreeBytes(bytesPerBlock uint32, checksumEnabled bool, checksumFunc checksumAppender) []byte {
+	b := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(b[:0x4], d.inode)
+	binary.LittleEndian.PutUint16(b[0x4:0x6], 12)
+	b[0x6] = 1
+	b[0x7] = uint8(dirFileTypeDirectory)
+	b[0x8] = '.'
 
-type dxNode interface {
-	entries() []directoryHashEntry
-}
+	for _, e := range d.entries {
+		if e.filename == ".." {
+			binary.LittleEndian.PutUint32(b[0xc:0x10], e.inode)
+			binary.LittleEndian.PutUint16(b[0x10:0x12], 12)
+			b[0x12] = 2
+			b[0x13] = uint8(dirFileTypeDirectory)
+			b[0x14] = '.'
+			b[0x15] = '.'
+			break
+		}
+	}
 
-type directoryHashNode struct {
-	childEntries []directoryHashEntry
-}
-
-func (d *directoryHashNode) entries() []directoryHashEntry {
-	return d.childEntries
+	// matches create super block hash version. is the the supported default? most recent?
+	b[0x1c] = byte(hashHalfMD4)
+	b[0x1d] = 0x8                                                                 // length of the tree
+	b[0x1e] = 0x00                                                                // tree depth TODO: determine the tree depth from the content (number of leaf nodes?), for now just set 0x00 and cross fingers
+	binary.LittleEndian.PutUint16(b[0x20:0x22], uint16((bytesPerBlock-0x28)/8)+1) // Maximum number of dx_entries that can follow this header, plus 1 for the header itself.
+	binary.LittleEndian.PutUint16(b[0x22:0x24], uint16(len(d.entries)))           // Actual number of dx_entries that follow this header, plus 1 for the header itself.
 }
 
 type directoryHashRoot struct {
 	inodeDir      uint32
 	inodeParent   uint32
 	hashVersion   hashVersion
+	limit         uint16
 	depth         uint8
+	blockNumber   uint32
 	hashAlgorithm hashAlgorithm
 	childEntries  []directoryHashEntry
 	dotEntry      *directoryEntry
@@ -155,13 +173,17 @@ func parseDirectoryTreeRoot(b []byte, largeDir bool) (node *directoryHashRoot, e
 		return nil, fmt.Errorf("directory hash tree root tree depth is %d and not between 0 and %d", treeDepth, maxTreeDepth)
 	}
 
+	dxEntriesLimit := binary.LittleEndian.Uint16(b[0x20:0x22])
 	dxEntriesCount := binary.LittleEndian.Uint16(b[0x22:0x24])
+	blockNumber := binary.LittleEndian.Uint32(b[0x24:0x28])
 
 	node = &directoryHashRoot{
 		inodeDir:      binary.LittleEndian.Uint32(b[0x0:0x4]),
 		inodeParent:   binary.LittleEndian.Uint32(b[0xC:0x10]),
 		hashAlgorithm: hashAlgorithm(b[0x1c]), // what hashing algorithm is used?
 		depth:         treeDepth,
+		blockNumber:   blockNumber,
+		limit:         dxEntriesLimit,
 		childEntries:  make([]directoryHashEntry, 0, int(dxEntriesCount)),
 		dotEntry: &directoryEntry{
 			inode:    dotInode,
@@ -209,3 +231,4 @@ func parseDirectoryTreeNode(b []byte) (node *directoryHashNode, err error) {
 
 	return node, nil
 }
+*/

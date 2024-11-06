@@ -2,6 +2,7 @@ package ext4
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -150,15 +151,16 @@ func (e extentLeafNode) blocks(_ *FileSystem) (extents, error) {
 
 // toBytes convert the node to raw bytes to be stored, either in a block or in an inode
 func (e extentLeafNode) toBytes() []byte {
+	var base int
 	// 12 byte header, 12 bytes per child
 	b := make([]byte, 12+12*e.max)
 	copy(b[0:12], e.extentNodeHeader.toBytes())
 
+	diskBlock := make([]byte, 8)
 	for i, ext := range e.extents {
-		base := (i + 1) * 12
+		base = (i + 1) * 12
 		binary.LittleEndian.PutUint32(b[base:base+4], ext.fileBlock)
 		binary.LittleEndian.PutUint16(b[base+4:base+6], ext.count)
-		diskBlock := make([]byte, 8)
 		binary.LittleEndian.PutUint64(diskBlock, ext.startingBlock)
 		copy(b[base+6:base+8], diskBlock[4:6])
 		copy(b[base+8:base+12], diskBlock[0:4])
@@ -196,8 +198,14 @@ type extentInternalNode struct {
 
 // findBlocks find the actual blocks for a range in the file. internal nodes need to read the filesystem to
 // get the child nodes, so the FileSystem reference is used.
-func (e extentInternalNode) findBlocks(start, count uint64, fs *FileSystem) ([]uint64, error) {
-	var ret []uint64
+func (e extentInternalNode) findBlocks(start, count uint64, fs *FileSystem) (ret []uint64, err error) {
+	var (
+		b           = make([]byte, fs.superblock.blockSize)
+		blocks      []uint64
+		extentStart uint64
+		extentEnd   uint64
+		ebf         extentBlockFinder
+	)
 
 	// before anything, figure out which file block is the start and end of the desired range
 	end := start + count - 1
@@ -206,8 +214,8 @@ func (e extentInternalNode) findBlocks(start, count uint64, fs *FileSystem) ([]u
 	// the hard part here is that each child has start but not end or count. You only know it from reading the next one.
 	// So if the one we are looking at is in the range, we get it from the children, and keep going
 	for _, child := range e.children {
-		extentStart := uint64(child.fileBlock)
-		extentEnd := uint64(child.fileBlock + child.count - 1)
+		extentStart = uint64(child.fileBlock)
+		extentEnd = uint64(child.fileBlock + child.count - 1)
 
 		// Check if the extent does not overlap with the given block range
 		if extentEnd < start || extentStart > end {
@@ -215,16 +223,13 @@ func (e extentInternalNode) findBlocks(start, count uint64, fs *FileSystem) ([]u
 		}
 
 		// read the extent block from the disk
-		b, err := fs.readBlock(child.diskBlock)
-		if err != nil {
+		if err = fs.readBlock(child.diskBlock, b); err != nil {
 			return nil, err
 		}
-		ebf, err := parseExtents(b, e.blockSize, uint32(extentStart), uint32(extentEnd))
-		if err != nil {
+		if ebf, err = parseExtents(b, e.blockSize, uint32(extentStart), uint32(extentEnd)); err != nil {
 			return nil, err
 		}
-		blocks, err := ebf.findBlocks(extentStart, uint64(child.count), fs)
-		if err != nil {
+		if blocks, err = ebf.findBlocks(extentStart, uint64(child.count), fs); err != nil {
 			return nil, err
 		}
 		if len(blocks) > 0 {
@@ -236,22 +241,23 @@ func (e extentInternalNode) findBlocks(start, count uint64, fs *FileSystem) ([]u
 
 // blocks find the actual blocks for a range in the file. leaf nodes already have all of the data inside,
 // so the FileSystem reference is unused.
-func (e extentInternalNode) blocks(fs *FileSystem) (extents, error) {
-	var ret extents
+func (e extentInternalNode) blocks(fs *FileSystem) (ret extents, err error) {
+	var (
+		b      = make([]byte, fs.superblock.blockSize)
+		blocks extents
+		ebf    extentBlockFinder
+	)
 
 	// we are not depth 0, so we have children extent tree nodes. Walk the tree below us and find all of the blocks
 	for _, child := range e.children {
 		// read the extent block from the disk
-		b, err := fs.readBlock(child.diskBlock)
-		if err != nil {
+		if err = fs.readBlock(child.diskBlock, b); err != nil {
 			return nil, err
 		}
-		ebf, err := parseExtents(b, e.blockSize, child.fileBlock, child.fileBlock+child.count-1)
-		if err != nil {
+		if ebf, err = parseExtents(b, e.blockSize, child.fileBlock, child.fileBlock+child.count-1); err != nil {
 			return nil, err
 		}
-		blocks, err := ebf.blocks(fs)
-		if err != nil {
+		if blocks, err = ebf.blocks(fs); err != nil {
 			return nil, err
 		}
 		if len(blocks) > 0 {
@@ -263,14 +269,16 @@ func (e extentInternalNode) blocks(fs *FileSystem) (extents, error) {
 
 // toBytes convert the node to raw bytes to be stored, either in a block or in an inode
 func (e extentInternalNode) toBytes() []byte {
+	var base int
+
 	// 12 byte header, 12 bytes per child
 	b := make([]byte, 12+12*e.max)
 	copy(b[0:12], e.extentNodeHeader.toBytes())
 
+	diskBlock := make([]byte, 8)
 	for i, child := range e.children {
-		base := (i + 1) * 12
+		base = (i + 1) * 12
 		binary.LittleEndian.PutUint32(b[base:base+4], child.fileBlock)
-		diskBlock := make([]byte, 8)
 		binary.LittleEndian.PutUint64(diskBlock, child.diskBlock)
 		copy(b[base+4:base+8], diskBlock[0:4])
 		copy(b[base+8:base+10], diskBlock[4:6])
@@ -301,11 +309,9 @@ func (e *extentInternalNode) getCount() uint32 {
 // It does not recurse down the tree, as we do not want to do that until we actually are ready
 // to read those blocks. This is similar to how ext4 driver in the Linux kernel does it.
 // totalBlocks is the total number of blocks covered in this given section of the extent tree.
-func parseExtents(b []byte, blocksize, start, count uint32) (extentBlockFinder, error) {
-	var ret extentBlockFinder
+func parseExtents(b []byte, blockSize, start, count uint32) (extentBlockFinder, error) {
 	// must have at least header and one entry
-	minLength := extentTreeHeaderLength + extentTreeEntryLength
-	if len(b) < minLength {
+	if minLength := extentTreeHeaderLength + extentTreeEntryLength; len(b) < minLength {
 		return nil, fmt.Errorf("cannot parse extent tree from %d bytes, minimum required %d", len(b), minLength)
 	}
 	// check magic signature
@@ -316,54 +322,57 @@ func parseExtents(b []byte, blocksize, start, count uint32) (extentBlockFinder, 
 		entries:   binary.LittleEndian.Uint16(b[0x2:0x4]),
 		max:       binary.LittleEndian.Uint16(b[0x4:0x6]),
 		depth:     binary.LittleEndian.Uint16(b[0x6:0x8]),
-		blockSize: blocksize,
+		blockSize: blockSize,
 	}
 	// b[0x8:0xc] is used for the generation by Lustre but not standard ext4, so we ignore
+
+	// don't allocate for every loop, the space can be reused
+	var (
+		index     int
+		diskBlock = make([]byte, 8)
+		size      = int(e.entries)
+	)
 
 	// we have parsed the header, now read either the leaf entries or the intermediate nodes
 	switch e.depth {
 	case 0:
 		leafNode := extentLeafNode{
 			extentNodeHeader: e,
+			extents:          make([]extent, size),
 		}
+
 		// read the leaves
-		for i := 0; i < int(e.entries); i++ {
-			start := i*extentTreeEntryLength + extentTreeHeaderLength
-			diskBlock := make([]byte, 8)
-			copy(diskBlock[0:4], b[start+8:start+12])
-			copy(diskBlock[4:6], b[start+6:start+8])
-			leafNode.extents = append(leafNode.extents, extent{
-				fileBlock:     binary.LittleEndian.Uint32(b[start : start+4]),
-				count:         binary.LittleEndian.Uint16(b[start+4 : start+6]),
-				startingBlock: binary.LittleEndian.Uint64(diskBlock),
-			})
+		for i := 0; i < size; i++ {
+			index = i*extentTreeEntryLength + extentTreeHeaderLength
+			copy(diskBlock[0:4], b[index+8:index+12])
+			copy(diskBlock[4:6], b[index+6:index+8])
+			leafNode.extents[i].fileBlock = binary.LittleEndian.Uint32(b[index : index+4])
+			leafNode.extents[i].count = binary.LittleEndian.Uint16(b[index+4 : index+6])
+			leafNode.extents[i].startingBlock = binary.LittleEndian.Uint64(diskBlock)
 		}
-		ret = &leafNode
+		return &leafNode, nil
 	default:
 		internalNode := extentInternalNode{
 			extentNodeHeader: e,
+			children:         make([]*extentChildPtr, size),
 		}
-		for i := 0; i < int(e.entries); i++ {
-			start := i*extentTreeEntryLength + extentTreeHeaderLength
-			diskBlock := make([]byte, 8)
-			copy(diskBlock[0:4], b[start+4:start+8])
-			copy(diskBlock[4:6], b[start+8:start+10])
-			ptr := &extentChildPtr{
+		for i := 0; i < size; i++ {
+			index = i*extentTreeEntryLength + extentTreeHeaderLength
+			copy(diskBlock[0:4], b[index+4:index+8])
+			copy(diskBlock[4:6], b[index+8:index+10])
+			internalNode.children[i] = &extentChildPtr{
 				diskBlock: binary.LittleEndian.Uint64(diskBlock),
-				fileBlock: binary.LittleEndian.Uint32(b[start : start+4]),
+				fileBlock: binary.LittleEndian.Uint32(b[index : index+4]),
 			}
-			internalNode.children = append(internalNode.children, ptr)
 			if i > 0 {
-				internalNode.children[i-1].count = ptr.fileBlock - internalNode.children[i-1].fileBlock
+				internalNode.children[i-1].count = internalNode.children[i].fileBlock - internalNode.children[i-1].fileBlock
 			}
 		}
-		if len(internalNode.children) > 0 {
+		if size > 0 {
 			internalNode.children[len(internalNode.children)-1].count = start + count - internalNode.children[len(internalNode.children)-1].fileBlock
 		}
-		ret = &internalNode
+		return &internalNode, nil
 	}
-
-	return ret, nil
 }
 
 // extendExtentTree extends extent tree with a slice of new extents
@@ -434,8 +443,7 @@ func extendLeafNode(node *extentLeafNode, added *extents, fs *FileSystem, parent
 		for _, n := range newNodes {
 			newNodesAsBlockFinder = append(newNodesAsBlockFinder, n)
 		}
-		newRoot := createInternalNode(newNodesAsBlockFinder, nil, fs)
-		return newRoot, nil
+		return createInternalNode(newNodesAsBlockFinder, nil, fs)
 	}
 
 	// If the original node was not the root, handle the parent internal node
@@ -494,8 +502,8 @@ func splitLeafNode(node *extentLeafNode, added *extents, fs *FileSystem, parent 
 	return []*extentLeafNode{firstLeaf, secondLeaf}, nil
 }
 
-func createInternalNode(nodes []extentBlockFinder, parent *extentInternalNode, fs *FileSystem) *extentInternalNode {
-	internalNode := &extentInternalNode{
+func createInternalNode(nodes []extentBlockFinder, parent *extentInternalNode, fs *FileSystem) (internalNode *extentInternalNode, err error) {
+	internalNode = &extentInternalNode{
 		extentNodeHeader: extentNodeHeader{
 			depth:     nodes[0].getDepth() + 1, // Depth is 1 more than the children
 			entries:   uint16(len(nodes)),
@@ -509,26 +517,49 @@ func createInternalNode(nodes []extentBlockFinder, parent *extentInternalNode, f
 		internalNode.children[i] = &extentChildPtr{
 			fileBlock: node.getFileBlock(),
 			count:     node.getCount(),
-			diskBlock: getBlockNumberFromNode(node, parent),
+		}
+		switch child := node.(type) {
+		case *extentLeafNode:
+			internalNode.children[i] = &extentChildPtr{
+				fileBlock: child.extents[0].fileBlock,
+				count:     uint32(len(child.extents)),
+			}
+			if internalNode.children[i].diskBlock, err = getBlockNumber(fs, child, parent); err != nil {
+				return nil, err
+			}
+		case *extentInternalNode:
+			internalNode.children[i] = &extentChildPtr{
+				fileBlock: child.children[0].fileBlock,
+				count:     uint32(len(child.children)),
+			}
+			if internalNode.children[i].diskBlock, err = getBlockNumber(fs, child, parent); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	// Write the new internal node to the disk
-	err := writeNodeToDisk(internalNode, fs, parent)
-	if err != nil {
-		return nil
+	if err = writeNodeToDisk(internalNode, fs, parent); err != nil {
+		return nil, fmt.Errorf("cannot write internal node to disk: %w", err)
 	}
 
-	return internalNode
+	return internalNode, nil
 }
 
-func getBlockNumberFromNode(node extentBlockFinder, parent *extentInternalNode) uint64 {
+func getBlockNumber(fs *FileSystem, node extentBlockFinder, parent *extentInternalNode) (uint64, error) {
+	if parent != nil {
+		return getBlockNumberFromNode(node, parent)
+	}
+	return getNewBlockNumber(node, fs)
+}
+
+func getBlockNumberFromNode(node extentBlockFinder, parent *extentInternalNode) (uint64, error) {
 	for _, childPtr := range parent.children {
 		if childPtrMatchesNode(childPtr, node) {
-			return childPtr.diskBlock
+			return childPtr.diskBlock, nil
 		}
 	}
-	return 0 // Return 0 or an appropriate error value if the block number is not found
+	return 0, errors.New("failed to find block number in node")
 }
 
 // Helper function to match a child pointer to a node
@@ -563,18 +594,22 @@ func extendInternalNode(node *extentInternalNode, added *extents, fs *FileSystem
 	}
 
 	// Update the current internal node to reference the updated child
-	switch updatedChild := updatedChild.(type) {
+	switch child := updatedChild.(type) {
 	case *extentLeafNode:
 		node.children[childIndex] = &extentChildPtr{
-			fileBlock: updatedChild.extents[0].fileBlock,
-			count:     uint32(len(updatedChild.extents)),
-			diskBlock: getBlockNumberFromNode(updatedChild, node),
+			fileBlock: child.extents[0].fileBlock,
+			count:     uint32(len(child.extents)),
+		}
+		if node.children[childIndex].diskBlock, err = getBlockNumberFromNode(child, node); err != nil {
+			return nil, err
 		}
 	case *extentInternalNode:
 		node.children[childIndex] = &extentChildPtr{
-			fileBlock: updatedChild.children[0].fileBlock,
-			count:     uint32(len(updatedChild.children)),
-			diskBlock: getBlockNumberFromNode(updatedChild, node),
+			fileBlock: child.children[0].fileBlock,
+			count:     uint32(len(child.children)),
+		}
+		if node.children[childIndex].diskBlock, err = getBlockNumberFromNode(child, node); err != nil {
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("unsupported updatedChild type")
@@ -583,8 +618,8 @@ func extendInternalNode(node *extentInternalNode, added *extents, fs *FileSystem
 	// Check if the internal node is at capacity
 	if len(node.children) > int(node.max) {
 		// Split the internal node if it's at capacity
-		newInternalNodes, err := splitInternalNode(node, node.children[childIndex], fs, parent)
-		if err != nil {
+		var newInternalNodes []*extentInternalNode
+		if newInternalNodes, err = splitInternalNode(node, node.children[childIndex], fs, parent); err != nil {
 			return nil, err
 		}
 
@@ -595,8 +630,7 @@ func extendInternalNode(node *extentInternalNode, added *extents, fs *FileSystem
 			for _, n := range newInternalNodes {
 				newNodesAsBlockFinder = append(newNodesAsBlockFinder, n)
 			}
-			newRoot := createInternalNode(newNodesAsBlockFinder, nil, fs)
-			return newRoot, nil
+			return createInternalNode(newNodesAsBlockFinder, nil, fs)
 		}
 
 		// If the original node was not the root, handle the parent internal node
@@ -668,30 +702,36 @@ func splitInternalNode(node *extentInternalNode, newChild *extentChildPtr, fs *F
 	return []*extentInternalNode{firstInternal, secondInternal}, nil
 }
 
-func writeNodeToDisk(node extentBlockFinder, fs *FileSystem, parent *extentInternalNode) error {
+func writeNodeToDisk(node extentBlockFinder, fs *FileSystem, parent *extentInternalNode) (err error) {
 	var blockNumber uint64
-	if parent != nil {
-		blockNumber = getBlockNumberFromNode(node, parent)
-	} else {
-		blockNumber = getNewBlockNumber(fs)
+	if blockNumber, err = getBlockNumber(fs, node, parent); err != nil {
+		return err
 	}
-
-	if blockNumber == 0 {
-		return fmt.Errorf("block number not found for node")
-	}
-
-	data := node.toBytes()
-	_, err := fs.file.WriteAt(data, int64(blockNumber)*int64(fs.superblock.blockSize))
+	_, err = fs.file.WriteAt(node.toBytes(), int64(blockNumber)*int64(fs.superblock.blockSize))
 	return err
 }
 
 // Helper function to get a new block number when there is no parent
 //
 //nolint:revive // this parameter will be used eventually
-func getNewBlockNumber(fs *FileSystem) uint64 {
+func getNewBlockNumber(node extentBlockFinder, fs *FileSystem) (uint64, error) {
 	// Logic to allocate a new block
 	// This is a placeholder and needs to be implemented based on your specific filesystem structure
-	return 0 // Placeholder: Replace with actual implementation
+
+	switch n := node.(type) {
+	case *extentLeafNode:
+		if len(n.extents) == 0 {
+			return 0, nil
+		}
+		return n.extents[0].startingBlock, nil
+	case *extentInternalNode:
+		if len(n.children) == 0 {
+			return 0, nil
+		}
+		return n.children[0].diskBlock, nil
+	default:
+		return 0, fmt.Errorf("unsupported node type: %T", node)
+	}
 }
 
 // Helper function to find the block number of a child node from its parent

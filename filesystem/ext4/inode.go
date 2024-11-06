@@ -3,6 +3,7 @@ package ext4
 import (
 	"encoding/binary"
 	"fmt"
+	"syscall"
 	"time"
 
 	"github.com/diskfs/go-diskfs/filesystem/ext4/crc"
@@ -57,16 +58,6 @@ const (
 	fileTypeRegularFile     fileType = 0x8000
 	fileTypeSymbolicLink    fileType = 0xA000
 	fileTypeSocket          fileType = 0xC000
-
-	filePermissionsOwnerExecute uint16 = 0x40
-	filePermissionsOwnerWrite   uint16 = 0x80
-	filePermissionsOwnerRead    uint16 = 0x100
-	filePermissionsGroupExecute uint16 = 0x8
-	filePermissionsGroupWrite   uint16 = 0x10
-	filePermissionsGroupRead    uint16 = 0x20
-	filePermissionsOtherExecute uint16 = 0x1
-	filePermissionsOtherWrite   uint16 = 0x2
-	filePermissionsOtherRead    uint16 = 0x4
 )
 
 // mountOptions is a structure holding flags for an inode
@@ -112,6 +103,9 @@ type inode struct {
 	permissionsOther       filePermissions
 	permissionsGroup       filePermissions
 	permissionsOwner       filePermissions
+	setGID                 bool
+	setUID                 bool
+	sticky                 bool
 	fileType               fileType
 	owner                  uint32
 	group                  uint32
@@ -185,7 +179,7 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 	copy(fileSize[4:8], b[0x6c:0x70])
 	copy(version[0:4], b[0x24:0x28])
 	copy(version[4:8], b[0x98:0x9c])
-	copy(extendedAttributeBlock[0:4], b[0x88:0x8c])
+	copy(extendedAttributeBlock[0:4], b[0x68:0x6c])
 	copy(extendedAttributeBlock[4:6], b[0x76:0x78])
 
 	// get the the times
@@ -224,22 +218,21 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		filesystemBlocks bool
 	)
 
-	hugeFile := sb.features.hugeFile
 	switch {
-	case !hugeFile:
+	case !sb.features.hugeFile:
 		// just 512-byte blocks
-		blocks = uint64(blocksLow)
+		blocks = uint64(blocksLow) * 512 / uint64(sb.blockSize)
 		filesystemBlocks = false
-	case hugeFile && !flags.hugeFile:
+	case !flags.hugeFile:
 		// larger number of 512-byte blocks
-		blocks = uint64(blocksHigh)<<32 + uint64(blocksLow)
+		blocks = (uint64(blocksHigh)<<32 + uint64(blocksLow)) * 512 / uint64(sb.blockSize)
 		filesystemBlocks = false
 	default:
 		// larger number of filesystem blocks
 		blocks = uint64(blocksHigh)<<32 + uint64(blocksLow)
 		filesystemBlocks = true
 	}
-	fileType := parseFileType(mode)
+	fType := parseFileType(mode)
 	fileSizeNum := binary.LittleEndian.Uint64(fileSize)
 
 	extentInfo := make([]byte, 60)
@@ -250,7 +243,7 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		allExtents extentBlockFinder
 		err        error
 	)
-	if fileType == fileTypeSymbolicLink && fileSizeNum < 60 {
+	if fType == fileTypeSymbolicLink && fileSizeNum < 60 {
 		linkTarget = string(extentInfo[:fileSizeNum])
 	} else {
 		// parse the extent information in the inode to get the root of the extents tree
@@ -267,7 +260,10 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		permissionsGroup:       parseGroupPermissions(mode),
 		permissionsOwner:       parseOwnerPermissions(mode),
 		permissionsOther:       parseOtherPermissions(mode),
-		fileType:               fileType,
+		sticky:                 mode&syscall.S_ISVTX == syscall.S_ISVTX,
+		setGID:                 mode&syscall.S_ISGID == syscall.S_ISGID,
+		setUID:                 mode&syscall.S_ISUID == syscall.S_ISUID,
+		fileType:               fType,
 		owner:                  binary.LittleEndian.Uint32(owner),
 		group:                  binary.LittleEndian.Uint32(group),
 		size:                   fileSizeNum,
@@ -288,11 +284,13 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		extents:                allExtents,
 		linkTarget:             linkTarget,
 	}
-	checksum := binary.LittleEndian.Uint32(checksumBytes)
-	actualChecksum := inodeChecksum(b, sb.checksumSeed, number, i.nfsFileVersion)
 
-	if actualChecksum != checksum {
-		return nil, fmt.Errorf("checksum mismatch, on-disk %x vs calculated %x", checksum, actualChecksum)
+	if sb.features.metadataChecksums {
+		checksum := binary.LittleEndian.Uint32(checksumBytes)
+		actualChecksum := inodeChecksum(b, sb.checksumSeed, number, i.nfsFileVersion)
+		if actualChecksum != checksum {
+			return nil, fmt.Errorf("checksum mismatch, on-disk %x vs calculated %x", checksum, actualChecksum)
+		}
 	}
 
 	return &i, nil
@@ -302,6 +300,7 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 //
 //nolint:unused // will be used in the future, not yet
 func (i *inode) toBytes(sb *superblock) []byte {
+
 	iSize := sb.inodeSize
 
 	b := make([]byte, iSize)
@@ -317,7 +316,18 @@ func (i *inode) toBytes(sb *superblock) []byte {
 	version := make([]byte, 8)
 	extendedAttributeBlock := make([]byte, 8)
 
-	binary.LittleEndian.PutUint16(mode, i.permissionsGroup.toGroupInt()|i.permissionsOther.toOtherInt()|i.permissionsOwner.toOwnerInt()|uint16(i.fileType))
+	modeFlag := i.permissionsGroup.toGroupInt() | i.permissionsOther.toOtherInt() | i.permissionsOwner.toOwnerInt() | uint16(i.fileType)
+	if i.sticky {
+		modeFlag |= syscall.S_ISVTX
+	}
+	if i.setGID {
+		modeFlag |= syscall.S_ISGID
+	}
+	if i.setUID {
+		modeFlag |= syscall.S_ISUID
+	}
+
+	binary.LittleEndian.PutUint16(mode, modeFlag)
 	binary.LittleEndian.PutUint32(owner, i.owner)
 	binary.LittleEndian.PutUint32(group, i.group)
 	binary.LittleEndian.PutUint64(fileSize, i.size)
@@ -328,36 +338,67 @@ func (i *inode) toBytes(sb *superblock) []byte {
 	// See https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout#Inode_Timestamps
 	// binary.LittleEndian.PutUint32(accessTime[4:8], (i.accessTimeNanoseconds<<2)&accessTime[4])
 	binary.LittleEndian.PutUint64(accessTime, uint64(i.accessTime.Unix()))
-	binary.LittleEndian.PutUint32(accessTime[4:8], uint32(i.accessTime.Nanosecond()))
-	binary.LittleEndian.PutUint64(createTime, uint64(i.createTime.Unix()))
-	binary.LittleEndian.PutUint32(createTime[4:8], uint32(i.createTime.Nanosecond()))
-	binary.LittleEndian.PutUint64(changeTime, uint64(i.changeTime.Unix()))
-	binary.LittleEndian.PutUint32(changeTime[4:8], uint32(i.changeTime.Nanosecond()))
-	binary.LittleEndian.PutUint64(modifyTime, uint64(i.modifyTime.Unix()))
-	binary.LittleEndian.PutUint32(modifyTime[4:8], uint32(i.modifyTime.Nanosecond()))
+	accessTime[4] = accessTime[4] & 0x3
+	copy(b[0x8:0xc], accessTime[0:4])
+	binary.LittleEndian.PutUint32(accessTime[4:8], uint32(i.accessTime.Nanosecond())<<2)
+	copy(b[0x8c:0x90], accessTime[4:8])
 
-	blocks := make([]byte, 8)
-	binary.LittleEndian.PutUint64(blocks, i.blocks)
+	binary.LittleEndian.PutUint64(createTime, uint64(i.createTime.Unix()))
+	createTime[4] = createTime[4] & 0x3
+	copy(b[0x90:0x94], createTime[0:4])
+	binary.LittleEndian.PutUint32(createTime[4:8], uint32(i.createTime.Nanosecond())<<2)
+	copy(b[0x94:0x98], createTime[4:8])
+
+	binary.LittleEndian.PutUint64(changeTime, uint64(i.changeTime.Unix()))
+	changeTime[4] = changeTime[4] & 0x3
+	copy(b[0xc:0x10], changeTime[0:4])
+	binary.LittleEndian.PutUint32(changeTime[4:8], uint32(i.changeTime.Nanosecond())<<2)
+	copy(b[0x84:0x88], changeTime[4:8])
+
+	binary.LittleEndian.PutUint64(modifyTime, uint64(i.modifyTime.Unix()))
+	modifyTime[4] = modifyTime[4] & 0x3
+	copy(b[0x10:0x14], modifyTime[0:4])
+	binary.LittleEndian.PutUint32(modifyTime[4:8], uint32(i.modifyTime.Nanosecond())<<2)
+	copy(b[0x88:0x8c], modifyTime[4:8])
+
+	//blocks := make([]byte, 8)
+	//binary.LittleEndian.PutUint64(blocks, i.blocks)
 
 	copy(b[0x0:0x2], mode)
 	copy(b[0x2:0x4], owner[0:2])
 	copy(b[0x4:0x8], fileSize[0:4])
-	copy(b[0x8:0xc], accessTime[0:4])
-	copy(b[0xc:0x10], changeTime[0:4])
-	copy(b[0x10:0x14], modifyTime[0:4])
 
 	binary.LittleEndian.PutUint32(b[0x14:0x18], i.deletionTime)
 	copy(b[0x18:0x1a], group[0:2])
 	binary.LittleEndian.PutUint16(b[0x1a:0x1c], i.hardLinks)
-	copy(b[0x1c:0x20], blocks[0:4])
+
+	switch {
+	case !sb.features.hugeFile:
+		// just 512-byte blocks
+		blocks := i.blocks * uint64(sb.blockSize) / 512
+		binary.LittleEndian.PutUint32(b[0x1c:0x20], uint32(blocks))
+	case !i.flags.hugeFile:
+		// larger number of 512-byte blocks
+		blocks := i.blocks * uint64(sb.blockSize) / 512
+		binary.LittleEndian.PutUint32(b[0x1c:0x20], uint32(blocks))
+		binary.LittleEndian.PutUint16(b[0x74:0x76], uint16(blocks>>32))
+	default:
+		// larger number of filesystem blocks
+		binary.LittleEndian.PutUint32(b[0x1c:0x20], uint32(i.blocks))
+		binary.LittleEndian.PutUint16(b[0x74:0x76], uint16(i.blocks>>32))
+	}
+
 	binary.LittleEndian.PutUint32(b[0x20:0x24], i.flags.toInt())
 	copy(b[0x24:0x28], version[0:4])
-	copy(b[0x28:0x64], i.extents.toBytes())
+	if i.fileType == fileTypeSymbolicLink && len(i.linkTarget) < 60 {
+		copy(b[0x28:0x64], i.linkTarget)
+	} else {
+		copy(b[0x28:0x64], i.extents.toBytes())
+	}
 	binary.LittleEndian.PutUint32(b[0x64:0x68], i.nfsFileVersion)
 	copy(b[0x68:0x6c], extendedAttributeBlock[0:4])
 	copy(b[0x6c:0x70], fileSize[4:8])
 	// b[0x70:0x74] is obsolete
-	copy(b[0x74:0x76], blocks[4:8])
 	copy(b[0x76:0x78], extendedAttributeBlock[4:6])
 	copy(b[0x78:0x7a], owner[2:4])
 	copy(b[0x7a:0x7c], group[2:4])
@@ -365,40 +406,37 @@ func (i *inode) toBytes(sb *superblock) []byte {
 	// b[0x7e:0x80] is unused
 	binary.LittleEndian.PutUint16(b[0x80:0x82], i.inodeSize-minInodeSize)
 	// b[0x82:0x84] is for checkeum
-	copy(b[0x84:0x88], changeTime[4:8])
-	copy(b[0x88:0x8c], modifyTime[4:8])
-	copy(b[0x8c:0x90], accessTime[4:8])
-	copy(b[0x90:0x94], createTime[0:4])
-	copy(b[0x94:0x98], createTime[4:8])
 
-	actualChecksum := inodeChecksum(b, sb.checksumSeed, i.number, i.nfsFileVersion)
-	checksum := make([]byte, 4)
-	binary.LittleEndian.PutUint32(checksum, actualChecksum)
-	copy(b[0x7c:0x7e], checksum[0:2])
-	copy(b[0x82:0x84], checksum[2:4])
+	if sb.features.metadataChecksums {
+		actualChecksum := inodeChecksum(b, sb.checksumSeed, i.number, i.nfsFileVersion)
+		checksum := make([]byte, 4)
+		binary.LittleEndian.PutUint32(checksum, actualChecksum)
+		copy(b[0x7c:0x7e], checksum[0:2])
+		copy(b[0x82:0x84], checksum[2:4])
+	}
 
 	return b
 }
 
 func parseOwnerPermissions(mode uint16) filePermissions {
 	return filePermissions{
-		execute: mode&filePermissionsOwnerExecute == filePermissionsOwnerExecute,
-		write:   mode&filePermissionsOwnerWrite == filePermissionsOwnerWrite,
-		read:    mode&filePermissionsOwnerRead == filePermissionsOwnerRead,
+		execute: mode&syscall.S_IXUSR == syscall.S_IXUSR,
+		write:   mode&syscall.S_IWUSR == syscall.S_IWUSR,
+		read:    mode&syscall.S_IRUSR == syscall.S_IRUSR,
 	}
 }
 func parseGroupPermissions(mode uint16) filePermissions {
 	return filePermissions{
-		execute: mode&filePermissionsGroupExecute == filePermissionsGroupExecute,
-		write:   mode&filePermissionsGroupWrite == filePermissionsGroupWrite,
-		read:    mode&filePermissionsGroupRead == filePermissionsGroupRead,
+		execute: mode&syscall.S_IXGRP == syscall.S_IXGRP,
+		write:   mode&syscall.S_IWGRP == syscall.S_IWGRP,
+		read:    mode&syscall.S_IRGRP == syscall.S_IRGRP,
 	}
 }
 func parseOtherPermissions(mode uint16) filePermissions {
 	return filePermissions{
-		execute: mode&filePermissionsOtherExecute == filePermissionsOtherExecute,
-		write:   mode&filePermissionsOtherWrite == filePermissionsOtherWrite,
-		read:    mode&filePermissionsOtherRead == filePermissionsOtherRead,
+		execute: mode&syscall.S_IXOTH == syscall.S_IXOTH,
+		write:   mode&syscall.S_IWOTH == syscall.S_IWOTH,
+		read:    mode&syscall.S_IROTH == syscall.S_IROTH,
 	}
 }
 
@@ -406,13 +444,13 @@ func parseOtherPermissions(mode uint16) filePermissions {
 func (fp *filePermissions) toOwnerInt() uint16 {
 	var mode uint16
 	if fp.execute {
-		mode |= filePermissionsOwnerExecute
+		mode |= syscall.S_IXUSR
 	}
 	if fp.write {
-		mode |= filePermissionsOwnerWrite
+		mode |= syscall.S_IWUSR
 	}
 	if fp.read {
-		mode |= filePermissionsOwnerRead
+		mode |= syscall.S_IRUSR
 	}
 	return mode
 }
@@ -421,13 +459,13 @@ func (fp *filePermissions) toOwnerInt() uint16 {
 func (fp *filePermissions) toOtherInt() uint16 {
 	var mode uint16
 	if fp.execute {
-		mode |= filePermissionsOtherExecute
+		mode |= syscall.S_IXOTH
 	}
 	if fp.write {
-		mode |= filePermissionsOtherWrite
+		mode |= syscall.S_IWOTH
 	}
 	if fp.read {
-		mode |= filePermissionsOtherRead
+		mode |= syscall.S_IROTH
 	}
 	return mode
 }
@@ -436,13 +474,13 @@ func (fp *filePermissions) toOtherInt() uint16 {
 func (fp *filePermissions) toGroupInt() uint16 {
 	var mode uint16
 	if fp.execute {
-		mode |= filePermissionsGroupExecute
+		mode |= syscall.S_IXGRP
 	}
 	if fp.write {
-		mode |= filePermissionsGroupWrite
+		mode |= syscall.S_IWGRP
 	}
 	if fp.read {
-		mode |= filePermissionsGroupRead
+		mode |= syscall.S_IRGRP
 	}
 	return mode
 }

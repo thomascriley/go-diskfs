@@ -3,14 +3,17 @@ package ext4
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+	"strings"
 )
 
 // directoryFileType uses different constants than the file type property in the inode
 type directoryFileType uint8
 
 const (
-	minDirEntryLength int = 12 // actually 9 for 1-byte file length, but must be multiple of 4 bytes
-	maxDirEntryLength int = 263
+	dirEntryHeaderLength int = 0x8
+	minDirEntryLength    int = 12 // actually 9 for 1-byte file length, but must be multiple of 4 bytes
+	maxDirEntryLength    int = 263
 
 	// directory file types
 	dirFileTypeUnknown   directoryFileType = 0x0
@@ -23,154 +26,166 @@ const (
 	dirFileTypeSymlink   directoryFileType = 0x7
 )
 
+type directoryEntries interface {
+	marshaler
+	unmarshaler
+	Entries() []*directoryEntry
+	AddEntry(entry *directoryEntry)
+	RemoveEntry(entry *directoryEntry)
+}
+
+func directoryEntriesSize(entries directoryEntries) int {
+	return entries.Size()
+}
+
 // directoryEntry is a single directory entry
 type directoryEntry struct {
-	inode    uint32
-	filename string
-	fileType directoryFileType
+	inode       uint32
+	length      uint16
+	filename    string
+	fileNameLen uint16
+	fileType    directoryFileType
+
+	// feature flags from superblock
+	hasFileType bool
 }
 
 func (de *directoryEntry) equal(other *directoryEntry) bool {
 	return de.inode == other.inode && de.filename == other.filename && de.fileType == other.fileType
 }
 
-func directoryEntryFromBytes(b []byte) (*directoryEntry, error) {
-	if len(b) < minDirEntryLength {
-		return nil, fmt.Errorf("directory entry of length %d is less than minimum %d", len(b), minDirEntryLength)
+func (de *directoryEntry) CalcSize() int {
+	// it must be the header length + filename length rounded up to nearest multiple of 4
+	nameLength := uint8(len(de.filename))
+	entryLength := int(nameLength) + dirEntryHeaderLength
+	if leftover := entryLength % 4; leftover > 0 {
+		entryLength += 4 - leftover
 	}
-	if len(b) > maxDirEntryLength {
-		b = b[:maxDirEntryLength]
-	}
-
-	//nolint:gocritic // keep this here for future reference
-	// length := binary.LittleEndian.Uint16(b[0x4:0x6])
-	nameLength := b[0x6]
-	name := b[0x8 : 0x8+nameLength]
-	de := directoryEntry{
-		inode:    binary.LittleEndian.Uint32(b[0x0:0x4]),
-		fileType: directoryFileType(b[0x7]),
-		filename: string(name),
-	}
-	return &de, nil
+	return entryLength
 }
 
-func directoryEntriesChecksumFromBytes(b []byte) (checksum uint32, err error) {
-	if len(b) != minDirEntryLength {
-		return checksum, fmt.Errorf("directory entry checksum of length %d is not required %d", len(b), minDirEntryLength)
+func (de *directoryEntry) Size() int {
+	entryLength := de.CalcSize()
+	if l := int(de.length); l > entryLength {
+		return l
 	}
-	inode := binary.LittleEndian.Uint32(b[0x0:0x4])
-	if inode != 0 {
-		return checksum, fmt.Errorf("directory entry checksum inode is not 0")
-	}
-	length := binary.LittleEndian.Uint16(b[0x4:0x6])
-	if int(length) != minDirEntryLength {
-		return checksum, fmt.Errorf("directory entry checksum length is not %d", minDirEntryLength)
-	}
-	nameLength := b[0x6]
-	if nameLength != 0 {
-		return checksum, fmt.Errorf("directory entry checksum name length is not 0")
-	}
-	fileType := b[0x7]
-	if fileType != 0xde {
-		return checksum, fmt.Errorf("directory entry checksum file type is not set to reserved 0xde")
-	}
-	return binary.LittleEndian.Uint32(b[0x8:0xc]), nil
+	return entryLength
 }
 
 // toBytes convert a directoryEntry to bytes. If isLast, then the size recorded is the number of bytes
 // from beginning of directory entry to end of block, minus the amount left for the checksum.
-func (de *directoryEntry) toBytes(withSize uint16) []byte {
-	// it must be the header length + filename length rounded up to nearest multiple of 4
-	nameLength := uint8(len(de.filename))
-	entryLength := uint16(nameLength) + 8
-	if leftover := entryLength % 4; leftover > 0 {
-		entryLength += (4 - leftover)
-	}
-
-	if withSize > 0 {
-		entryLength = withSize
-	}
-	b := make([]byte, entryLength)
-	binary.LittleEndian.PutUint32(b[0x0:0x4], de.inode)
-	binary.LittleEndian.PutUint16(b[0x4:0x6], entryLength)
-	b[0x6] = nameLength
-	b[0x7] = byte(de.fileType)
-	copy(b[0x8:], de.filename)
-
+func (de *directoryEntry) toBytes() []byte {
+	b := make([]byte, de.length)
+	_ = de.MarshalExt4(b)
 	return b
 }
 
-func parseDirEntriesLinear(b []byte, withChecksums bool, blocksize, inodeNumber, inodeGeneration, checksumSeed uint32) ([]*directoryEntry, error) {
-	// checksum if needed
-	if withChecksums {
-		var (
-			newb                []byte
-			checksumEntryOffset = int(blocksize) - minDirEntryLength
-			checksumOffset      = int(blocksize) - 4
-		)
-		checksummer := directoryChecksummer(checksumSeed, inodeNumber, inodeGeneration)
-		for i := 0; i < len(b); i += int(blocksize) {
-			block := b[i : i+int(blocksize)]
-			inBlockChecksum := block[checksumOffset:]
-			block = block[:checksumEntryOffset]
-			// save everything except the checksum
-			newb = append(newb, block...)
-			// checksum the entire block
-			checksumValue := binary.LittleEndian.Uint32(inBlockChecksum)
-			// checksum the block
-			actualChecksum := checksummer(block)
-			if actualChecksum != checksumValue {
-				return nil, fmt.Errorf("directory block checksum mismatch: expected %x, got %x", checksumValue, actualChecksum)
-			}
-		}
-		b = newb
+func (de *directoryEntry) UnmarshalExt4(b []byte) (err error) {
+	if err = de.UnmarshalExt4Header(b); err != nil {
+		return fmt.Errorf("failed to deserialize header: %w", err)
 	}
-
-	// convert into directory entries
-	entries := make([]*directoryEntry, 0, 4)
-	count := 0
-	for i := 0; i < len(b); count++ {
-		// read the length of the entry
-		length := binary.LittleEndian.Uint16(b[i+0x4 : i+0x6])
-		de, err := directoryEntryFromBytes(b[i : i+int(length)])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse directory entry %d: %v", count, err)
-		}
-		entries = append(entries, de)
-		i += int(length)
-	}
-	return entries, nil
+	return de.UnmarshalExt4FileName(b[dirEntryHeaderLength:])
 }
 
-// parseDirEntriesHashed parse hashed data blocks to get directory entries.
-// If hashedName is 0, returns all directory entries; otherwise, returns a slice with a single entry with the given name.
-func parseDirEntriesHashed(b []byte, depth uint8, node dxNode, blocksize uint32, withChecksums bool, inodeNumber, inodeGeneration, checksumSeed uint32) (dirEntries []*directoryEntry, err error) {
-	for _, entry := range node.entries() {
-		var (
-			addDirEntries []*directoryEntry
-			start         = entry.block * blocksize
-			end           = start + blocksize
-		)
-
-		nextBlock := b[start:end]
-		if depth == 0 {
-			addDirEntries, err = parseDirEntriesLinear(nextBlock, withChecksums, blocksize, inodeNumber, inodeGeneration, checksumSeed)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing linear directory entries: %w", err)
-			}
-		} else {
-			// recursively parse the next level of the tree
-			// read the next level down
-			node, err := parseDirectoryTreeNode(nextBlock)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing directory tree node: %w", err)
-			}
-			addDirEntries, err = parseDirEntriesHashed(b, depth-1, node, blocksize, withChecksums, inodeNumber, inodeGeneration, checksumSeed)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing hashed directory entries: %w", err)
-			}
-		}
-		dirEntries = append(dirEntries, addDirEntries...)
+func (de *directoryEntry) UnmarshalExt4Header(b []byte) (err error) {
+	var offset int
+	if offset, err = toUint32(b, 0x0, &de.inode); err != nil {
+		return fmt.Errorf("failed to deserialize inode: %w", err)
 	}
-	return dirEntries, nil
+	if offset, err = toUint16(b, offset, &de.length); err != nil {
+		return fmt.Errorf("failed to deserialize length: %w", err)
+	}
+	if de.hasFileType {
+		var short uint8
+		if offset, err = toUint8(b, offset, &short); err != nil {
+			return fmt.Errorf("failed to deserialize file name length: %w", err)
+		}
+		de.fileNameLen = uint16(short)
+		if offset, err = toDirectoryFileType(b, offset, &de.fileType); err != nil {
+			return fmt.Errorf("failed to deserialize file type: %w", err)
+		}
+	} else {
+		if offset, err = toUint16(b, offset, &de.fileNameLen); err != nil {
+			return fmt.Errorf("failed to deserialize file name length: %w", err)
+		}
+	}
+	return nil
+}
+
+func (de *directoryEntry) UnmarshalExt4FileName(b []byte) (err error) {
+	if maxLen := uint16(maxDirEntryLength - dirEntryHeaderLength); de.fileNameLen > maxLen {
+		de.fileNameLen = maxLen
+	}
+	if _, err = toString(b, 0, int(de.fileNameLen), &de.filename); err != nil {
+		return fmt.Errorf("failed to deserialize file name: %w", err)
+	}
+	return err
+}
+
+func (de *directoryEntry) UnmarshalExt4From(reader io.Reader) (err error) {
+	bs := make([]byte, dirEntryHeaderLength)
+	if _, err = reader.Read(bs); err != nil {
+		return err
+	}
+	if err = de.UnmarshalExt4Header(bs); err != nil {
+		return err
+	}
+	bs = make([]byte, de.fileNameLen)
+	if _, err = reader.Read(bs); err != nil {
+		return err
+	}
+	if err = de.UnmarshalExt4FileName(bs[dirEntryHeaderLength:]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (de *directoryEntry) MarshalExt4(b []byte) (err error) {
+	// calc size is the actual number of bytes needed to write all the information including the filename
+	// calc size can be different than de.length as de.length may need to extend to the end of the block
+	if len(b) < de.CalcSize() {
+		return fmt.Errorf("directory entry of bytes of length %d is too short for the calculated size %d", len(b), de.CalcSize())
+	}
+	if int(de.length) < minDirEntryLength {
+		return fmt.Errorf("the directory entry length %d, is less than the minimum size %d", de.length, minDirEntryLength)
+	}
+	fileNameLen := uint16(len(de.filename))
+	binary.LittleEndian.PutUint32(b[0x0:0x4], de.inode)
+
+	// assumed that when the filename changes or the entry is created, this value is changed and the entire directory block is rewritten
+	binary.LittleEndian.PutUint16(b[0x4:0x6], de.length)
+
+	if de.hasFileType {
+		b[0x6] = uint8(fileNameLen)
+		b[0x7] = byte(de.fileType)
+	} else {
+		binary.LittleEndian.PutUint16(b[0x6:0x8], fileNameLen)
+	}
+	copy(b[0x8:], de.filename)
+	return nil
+}
+
+func (de *directoryEntry) MarshalExt4To(writer io.Writer) (err error) {
+	buf := make([]byte, 4)
+	fileNameLen := uint16(len(de.filename))
+	binary.LittleEndian.PutUint32(buf[:0x4], de.inode)
+	if _, err = writer.Write(buf[:0x4]); err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint16(buf[:0x2], uint16(de.Size()))
+	if _, err = writer.Write(buf[:0x2]); err != nil {
+		return err
+	}
+	if de.hasFileType {
+		if _, err = writer.Write([]byte{uint8(fileNameLen), byte(de.fileType)}); err != nil {
+			return err
+		}
+	} else {
+		binary.LittleEndian.PutUint16(buf[:0x2], de.fileNameLen)
+		if _, err = writer.Write(buf[:0x2]); err != nil {
+			return err
+		}
+	}
+	_, err = io.Copy(writer, strings.NewReader(de.filename))
+	return err
 }

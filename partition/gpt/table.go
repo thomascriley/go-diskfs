@@ -9,7 +9,7 @@ import (
 
 	"github.com/diskfs/go-diskfs/partition/part"
 	"github.com/diskfs/go-diskfs/util"
-	uuid "github.com/google/uuid"
+	"github.com/google/uuid"
 )
 
 // gptSize max potential size for partition array reserved 16384
@@ -550,6 +550,7 @@ func Read(f util.File, logicalBlockSize, physicalBlockSize int) (*Table, error) 
 	if read != len(b) {
 		return nil, fmt.Errorf("read only %d bytes of GPT from file instead of expected %d", read, len(b))
 	}
+
 	// get the gpt table
 	gptTable, err := tableFromBytes(b, logicalBlockSize, physicalBlockSize)
 	if err != nil {

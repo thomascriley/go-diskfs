@@ -34,6 +34,13 @@ func NewBitmap(bytes int) *Bitmap {
 	return &bm
 }
 
+func BitmapWithBytes(bs []byte) *Bitmap {
+	bm := Bitmap{
+		bits: bs,
+	}
+	return &bm
+}
+
 // ToBytes returns raw bytes underlying the bitmap
 func (bm *Bitmap) ToBytes() []byte {
 	b := make([]byte, len(bm.bits))

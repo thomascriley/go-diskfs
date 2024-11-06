@@ -10,7 +10,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/diskfs/go-diskfs/util"
-	uuid "github.com/google/uuid"
+	"github.com/google/uuid"
 )
 
 // PartitionEntrySize fixed size of a GPT partition entry

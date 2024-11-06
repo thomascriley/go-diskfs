@@ -66,9 +66,9 @@ func TestReadDirectory(t *testing.T) {
 				sortFunc := func(a, b *directoryEntry) int {
 					return cmp.Compare(a.filename, b.filename)
 				}
-				slices.SortFunc(entries, sortFunc)
+				slices.SortFunc(entries.Entries(), sortFunc)
 				slices.SortFunc(tt.entries, sortFunc)
-				if diff := deep.Equal(entries, tt.entries); diff != nil {
+				if diff := deep.Equal(entries.Entries(), tt.entries); diff != nil {
 					t.Errorf("directory entries mismatch: %v", diff)
 				}
 			}
@@ -111,7 +111,7 @@ func TestReadFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fsFile, err := fs.OpenFile(tt.path, 0o600)
+			fsFile, err := fs.OpenFile(tt.path, 0o600, 0)
 			switch {
 			case err != nil && tt.err == nil:
 				t.Fatalf("unexpected error opening file: %v", err)
@@ -215,7 +215,7 @@ func TestWriteFile(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error reading filesystem: %v", err)
 			}
-			file, err := fs.OpenFile(tt.path, tt.flag)
+			file, err := fs.OpenFile(tt.path, tt.flag, 0)
 			switch {
 			case err != nil && tt.err == nil:
 				t.Fatalf("unexpected error opening file: %v", err)
@@ -264,7 +264,7 @@ func TestRm(t *testing.T) {
 		{"root dir", "/", errors.New("cannot remove root directory")},
 		{"root file", "/random.dat", nil},
 		{"subdir file", "/foo/subdirfile.txt", nil},
-		{"nonexistent file", "/foo/nonexistent.dat", errors.New("file does not exist")},
+		{"nonexistent file", "/foo/nonexistent.dat", os.ErrNotExist},
 		{"non-empty dir", "/foo", errors.New("directory not empty")},
 		{"empty dir", "/foo/dir1", nil},
 	}
@@ -280,7 +280,7 @@ func TestRm(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error reading filesystem: %v", err)
 			}
-			err = fs.Rm(tt.path)
+			err = fs.Remove(tt.path)
 			switch {
 			case err != nil && tt.err == nil:
 				t.Fatalf("unexpected error removing file: %v", err)
@@ -290,7 +290,7 @@ func TestRm(t *testing.T) {
 				t.Fatalf("mismatched error removing file, expected '%v' got '%v'", tt.err, err)
 			case err == nil:
 				// make sure the file no longer exists
-				_, err := fs.OpenFile(tt.path, 0)
+				_, err := fs.OpenFile(tt.path, 0, 0)
 				if err == nil {
 					t.Fatalf("expected error opening file after removal")
 				}
@@ -383,7 +383,7 @@ func TestMkdir(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error reading filesystem: %v", err)
 			}
-			err = fs.Mkdir(tt.path)
+			err = fs.Mkdir(tt.path, 0777)
 			switch {
 			case err != nil && tt.err == nil:
 				t.Fatalf("unexpected error creating directory: %v", err)

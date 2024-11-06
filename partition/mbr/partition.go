@@ -95,6 +95,7 @@ func partitionFromBytes(b []byte, logicalSectorSize, physicalSectorSize int) (*P
 	if len(b) != partitionEntrySize {
 		return nil, fmt.Errorf("data for partition was %d bytes instead of expected %d", len(b), partitionEntrySize)
 	}
+
 	var bootable bool
 	switch b[0] {
 	case 0x00:

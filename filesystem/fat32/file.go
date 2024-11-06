@@ -112,7 +112,12 @@ func (fl *File) Write(p []byte) (int, error) {
 	}
 	// what is the new file size?
 	writeSize := len(p)
-	oldSize := int64(fl.fileSize)
+	var oldSize int64
+	if fl.isAppend {
+		oldSize = int64(fl.fileSize)
+	} else {
+		oldSize = int64(fl.offset)
+	}
 	newSize := fl.offset + int64(writeSize)
 	if newSize < oldSize {
 		newSize = oldSize

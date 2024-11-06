@@ -7,14 +7,18 @@ import (
 )
 
 func TestDirectoryEntriesFromBytes(t *testing.T) {
-	expected, blocksize, b, err := testGetValidRootDirectory()
+	expected, blockSize, b, err := testGetValidRootDirectory()
 	if err != nil {
 		t.Fatal(err)
 	}
 	// remove checksums, as we are not testing those here
 	b = b[:len(b)-minDirEntryLength]
-	entries, err := parseDirEntriesLinear(b, false, blocksize, 2, 0, 0)
-	if err != nil {
+	// convert into directory entries
+	entries := &directoryEntriesLinear{
+		bytesPerBlock: blockSize,
+		hasFileType:   true,
+	}
+	if err = entries.UnmarshalExt4(b); err != nil {
 		t.Fatalf("Failed to parse directory entries: %v", err)
 	}
 	deep.CompareUnexportedFields = true

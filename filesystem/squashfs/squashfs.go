@@ -2,6 +2,7 @@ package squashfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -34,6 +35,11 @@ type FileSystem struct {
 	xattrs     *xAttrTable
 	rootDir    inode
 	cache      *lru
+}
+
+func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
+	//TODO implement me
+	panic("implement me")
 }
 
 // Equal compare if two filesystems are equal
@@ -258,17 +264,24 @@ func (fs *FileSystem) GetCacheSize() int {
 	return fs.cache.maxBlocks * int(fs.blocksize)
 }
 
+// Symlink creates newname as a symbolic link to oldname. On Windows, a symlink to a non-existent oldname creates a file
+// symlink; if oldname is later created as a directory the symlink will not work. If there is an error, it will be of
+// type *LinkError. - NOT SUPPORTED
+func (fs *FileSystem) Symlink(oldName string, newName string) (err error) {
+	return errors.New("not supported")
+}
+
 // Mkdir make a directory at the given path. It is equivalent to `mkdir -p`, i.e. idempotent, in that:
 //
 // * It will make the entire tree path if it does not exist
 // * It will not return an error if the path already exists
 //
 // if readonly and not in workspace, will return an error
-func (fs *FileSystem) Mkdir(p string) error {
+func (fs *FileSystem) Mkdir(p string, perm os.FileMode) error {
 	if fs.workspace == "" {
 		return fmt.Errorf("cannot write to read-only filesystem")
 	}
-	err := os.MkdirAll(path.Join(fs.workspace, p), 0o755)
+	err := os.MkdirAll(path.Join(fs.workspace, p), perm)
 	if err != nil {
 		return fmt.Errorf("could not create directory %s: %v", p, err)
 	}
@@ -319,7 +332,7 @@ func (fs *FileSystem) ReadDir(p string) ([]os.FileInfo, error) {
 // accepts normal os.OpenFile flags
 //
 // returns an error if the file does not exist
-func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
+func (fs *FileSystem) OpenFile(p string, flag int, perm os.FileMode) (filesystem.File, error) {
 	var f filesystem.File
 	var err error
 
@@ -370,7 +383,7 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 			return nil, err
 		}
 	} else {
-		f, err = os.OpenFile(path.Join(fs.workspace, p), flag, 0o644)
+		f, err = os.OpenFile(path.Join(fs.workspace, p), flag, perm)
 		if err != nil {
 			return nil, fmt.Errorf("target file %s does not exist: %v", p, err)
 		}

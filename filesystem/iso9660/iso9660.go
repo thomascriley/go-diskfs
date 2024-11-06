@@ -2,6 +2,7 @@ package iso9660
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -31,6 +32,11 @@ type FileSystem struct {
 	suspEnabled    bool  // is the SUSP in use?
 	suspSkip       uint8 // how many bytes to skip in each directory record
 	suspExtensions []suspExtension
+}
+
+func (fsm *FileSystem) Stat(name string) (os.FileInfo, error) {
+	//TODO implement me
+	panic("implement me")
 }
 
 // Equal compare if two filesystems are equal
@@ -287,17 +293,24 @@ func (fsm *FileSystem) Type() filesystem.Type {
 	return filesystem.TypeISO9660
 }
 
+// Symlink creates newname as a symbolic link to oldname. On Windows, a symlink to a non-existent oldname creates a file
+// symlink; if oldname is later created as a directory the symlink will not work. If there is an error, it will be of
+// type *LinkError.- NOT SUPPORTED
+func (fsm *FileSystem) Symlink(oldName string, newName string) (err error) {
+	return errors.New("not supported")
+}
+
 // Mkdir make a directory at the given path. It is equivalent to `mkdir -p`, i.e. idempotent, in that:
 //
 // * It will make the entire tree path if it does not exist
 // * It will not return an error if the path already exists
 //
 // if readonly and not in workspace, will return an error
-func (fsm *FileSystem) Mkdir(p string) error {
+func (fsm *FileSystem) Mkdir(p string, perm os.FileMode) error {
 	if fsm.workspace == "" {
 		return fmt.Errorf("cannot write to read-only filesystem")
 	}
-	err := os.MkdirAll(path.Join(fsm.workspace, p), 0o755)
+	err := os.MkdirAll(path.Join(fsm.workspace, p), perm)
 	if err != nil {
 		return fmt.Errorf("could not create directory %s: %v", p, err)
 	}
@@ -307,7 +320,7 @@ func (fsm *FileSystem) Mkdir(p string) error {
 
 // ReadDir return the contents of a given directory in a given filesystem.
 //
-// Returns a slice of os.FileInfo with all of the entries in the directory.
+// Returns a slice of os.FileInfo with all the entries in the directory.
 //
 // Will return an error if the directory does not exist or is a regular file and not a directory
 func (fsm *FileSystem) ReadDir(p string) ([]os.FileInfo, error) {
@@ -351,7 +364,7 @@ func (fsm *FileSystem) ReadDir(p string) ([]os.FileInfo, error) {
 // accepts normal os.OpenFile flags
 //
 // returns an error if the file does not exist
-func (fsm *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
+func (fsm *FileSystem) OpenFile(p string, flag int, perm os.FileMode) (filesystem.File, error) {
 	var f filesystem.File
 	var err error
 
@@ -405,7 +418,7 @@ func (fsm *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 			offset:         0,
 		}
 	} else {
-		f, err = os.OpenFile(path.Join(fsm.workspace, p), flag, 0o644)
+		f, err = os.OpenFile(path.Join(fsm.workspace, p), flag, perm)
 		if err != nil {
 			return nil, fmt.Errorf("target file %s does not exist: %v", p, err)
 		}

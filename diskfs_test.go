@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	diskfs "github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs"
 	"github.com/diskfs/go-diskfs/disk"
 )
 

@@ -40,7 +40,7 @@ type blockGroupFlags struct {
 
 // groupdescriptors is a structure holding all of the group descriptors for all of the block groups
 type groupDescriptors struct {
-	descriptors []groupDescriptor
+	descriptors []*groupDescriptor // gd is commonly used as a variable with it's properties changed
 }
 
 // groupDescriptor is a structure holding the data about a single block group
@@ -88,7 +88,7 @@ func (gds *groupDescriptors) equal(a *groupDescriptors) bool {
 // groupDescriptorsFromBytes create a groupDescriptors struct from bytes
 func groupDescriptorsFromBytes(b []byte, gdSize uint16, hashSeed uint32, checksumType gdtChecksumType) (*groupDescriptors, error) {
 	gds := groupDescriptors{}
-	gdSlice := make([]groupDescriptor, 0, 10)
+	gdSlice := make([]*groupDescriptor, 0, 10)
 
 	count := len(b) / int(gdSize)
 
@@ -100,7 +100,7 @@ func groupDescriptorsFromBytes(b []byte, gdSize uint16, hashSeed uint32, checksu
 		if err != nil || gd == nil {
 			return nil, fmt.Errorf("error creating group descriptor from bytes: %w", err)
 		}
-		gdSlice = append(gdSlice, *gd)
+		gdSlice = append(gdSlice, gd)
 	}
 	gds.descriptors = gdSlice
 
@@ -120,13 +120,13 @@ func (gds *groupDescriptors) toBytes(checksumType gdtChecksumType, hashSeed uint
 
 // byFreeBlocks provides a sorted list of groupDescriptors by free blocks, descending.
 // If you want them ascending, sort if.
-func (gds *groupDescriptors) byFreeBlocks() []groupDescriptor {
+func (gds *groupDescriptors) byFreeBlocks() []*groupDescriptor {
 	// make a copy of the slice
-	gdSlice := make([]groupDescriptor, len(gds.descriptors))
+	gdSlice := make([]*groupDescriptor, len(gds.descriptors))
 	copy(gdSlice, gds.descriptors)
 
 	// sort the slice
-	slices.SortFunc(gdSlice, func(a, b groupDescriptor) int {
+	slices.SortFunc(gdSlice, func(a, b *groupDescriptor) int {
 		return cmp.Compare(a.freeBlocks, b.freeBlocks)
 	})
 
@@ -175,13 +175,18 @@ func groupDescriptorFromBytes(b []byte, gdSize uint16, number int, checksumType 
 	// only bother with checking the checksum if it was not type none (pre-checksums)
 	if checksumType != gdtChecksumNone {
 		checksum := binary.LittleEndian.Uint16(b[0x1e:0x20])
-		actualChecksum := groupDescriptorChecksum(b[0x0:0x40], hashSeed, gdNumber, checksumType)
-		if checksum != actualChecksum {
-			return nil, fmt.Errorf("checksum mismatch, passed %x, actual %x", checksum, actualChecksum)
+		var actualCheckSum uint16
+		if gdSize == 64 {
+			actualCheckSum = groupDescriptorChecksum(b[0x0:0x40], hashSeed, gdNumber, checksumType)
+		} else {
+			actualCheckSum = groupDescriptorChecksum(b[0x0:0x20], hashSeed, gdNumber, checksumType)
+		}
+		if checksum != actualCheckSum {
+			return nil, fmt.Errorf("checksum mismatch, passed %x, actual %x", checksum, actualCheckSum)
 		}
 	}
 
-	gd := groupDescriptor{
+	gd := &groupDescriptor{
 		size:                            gdSize,
 		number:                          gdNumber,
 		blockBitmapLocation:             binary.LittleEndian.Uint64(blockBitmapLocation),
@@ -197,14 +202,12 @@ func groupDescriptorFromBytes(b []byte, gdSize uint16, number int, checksumType 
 		flags:                           parseBlockGroupFlags(binary.LittleEndian.Uint16(b[0x12:0x14])),
 	}
 
-	return &gd, nil
+	return gd, nil
 }
 
 // toBytes returns a groupDescriptor ready to be written to disk
 func (gd *groupDescriptor) toBytes(checksumType gdtChecksumType, hashSeed uint32) []byte {
-	gdSize := gd.size
-
-	b := make([]byte, gdSize)
+	b := make([]byte, gd.size)
 
 	blockBitmapLocation := make([]byte, 8)
 	inodeBitmapLocation := make([]byte, 8)
@@ -255,7 +258,14 @@ func (gd *groupDescriptor) toBytes(checksumType gdtChecksumType, hashSeed uint32
 		copy(b[0x3a:0x3c], inodeBitmapChecksum[2:4])
 	}
 
-	checksum := groupDescriptorChecksum(b[0x0:0x40], hashSeed, gd.number, checksumType)
+	var content []byte
+	if gd.size == 64 {
+		content = b[0x0:0x40]
+	} else {
+		content = b[0x0:0x20]
+	}
+	checksum := groupDescriptorChecksum(content, hashSeed, gd.number, checksumType)
+
 	binary.LittleEndian.PutUint16(b[0x1e:0x20], checksum)
 
 	return b
@@ -324,4 +334,12 @@ func groupDescriptorChecksum(b []byte, hashSeed uint32, groupNumber uint16, chec
 		checksum = crc.CRC16(crcResult, b)
 	}
 	return checksum
+}
+
+func bitmapChecksum(b []byte, hashSeed uint32, fs64Bit bool) uint32 {
+	crcResult := crc.CRC32c(hashSeed, b)
+	if !fs64Bit {
+		return crcResult & 0xffff
+	}
+	return crcResult
 }

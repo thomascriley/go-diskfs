@@ -15,6 +15,14 @@ type FileInfo struct {
 	isDir   bool
 }
 
+func (fi *FileInfo) Type() os.FileMode {
+	return fi.mode
+}
+
+func (fi *FileInfo) Info() (os.FileInfo, error) {
+	return fi, nil
+}
+
 // IsDir abbreviation for Mode().IsDir()
 func (fi *FileInfo) IsDir() bool {
 	return fi.isDir

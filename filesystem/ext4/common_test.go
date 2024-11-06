@@ -573,7 +573,7 @@ var testSuperblockFuncs = map[string]testSuperblockFunc{
 	},
 }
 
-func testGetValidSuperblockAndGDTs() (sb *superblock, gd []groupDescriptor, superblockBytes, gdtBytes []byte, err error) {
+func testGetValidSuperblockAndGDTs() (sb *superblock, gd []*groupDescriptor, superblockBytes, gdtBytes []byte, err error) {
 	// get the raw bytes
 	superblockBytes, err = os.ReadFile(testSuperblockFile)
 	if err != nil {
@@ -593,7 +593,7 @@ func testGetValidSuperblockAndGDTs() (sb *superblock, gd []groupDescriptor, supe
 	// parse the stats
 	sb = &superblock{}
 	var (
-		descs        []groupDescriptor
+		descs        []*groupDescriptor
 		inGroups     bool
 		currentGroup *groupDescriptor
 	)
@@ -625,7 +625,7 @@ func testGetValidSuperblockAndGDTs() (sb *superblock, gd []groupDescriptor, supe
 				if i == 0 {
 					// this is the first line, so we need to save the previous group
 					if currentGroup != nil {
-						descs = append(descs, *currentGroup)
+						descs = append(descs, currentGroup)
 					}
 					currentGroup = &groupDescriptor{size: 64}
 				}

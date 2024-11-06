@@ -17,7 +17,6 @@ type filesystemState uint16
 type errorBehaviour uint16
 type osFlag uint32
 type feature uint32
-type hashAlgorithm byte
 type flag uint32
 type encryptionAlgorithm byte
 
@@ -45,7 +44,8 @@ const (
 	errorsRemountReadOnly errorBehaviour = 2
 	errorsPanic           errorBehaviour = 3
 	// checksum type
-	checkSumTypeCRC32c byte = 1
+	checkSumTypeNotUsed byte = 0
+	checkSumTypeCRC32c  byte = 1
 	// oses
 	osLinux   osFlag = 0
 	osHurd    osFlag = 1
@@ -96,12 +96,12 @@ const (
 	roCompatFeatureReadOnly                         feature = 0x1000
 	roCompatFeatureProjectQuotas                    feature = 0x2000
 	// hash algorithms for htree directory entries
-	hashLegacy          hashAlgorithm = 0x0
-	hashHalfMD4         hashAlgorithm = 0x1
-	hashTea             hashAlgorithm = 0x2
-	hashLegacyUnsigned  hashAlgorithm = 0x3
-	hashHalfMD4Unsigned hashAlgorithm = 0x4
-	hashTeaUnsigned     hashAlgorithm = 0x5
+	hashLegacy          hashVersion = 0x0
+	hashHalfMD4         hashVersion = 0x1
+	hashTea             hashVersion = 0x2
+	hashLegacyUnsigned  hashVersion = 0x3
+	hashHalfMD4Unsigned hashVersion = 0x4
+	hashTeaUnsigned     hashVersion = 0x5
 	// miscellaneous flags
 	flagSignedDirectoryHash   flag = 0x0001
 	flagUnsignedDirectoryHash flag = 0x0002
@@ -112,6 +112,17 @@ const (
 	encryptionAlgorithm256AESXTS encryptionAlgorithm = 1
 	encryptionAlgorithm256AESGCM encryptionAlgorithm = 2
 	encryptionAlgorithm256AESCBC encryptionAlgorithm = 3
+
+	ext4MinDescSize      = 32
+	ext4MinDescSize64bit = 64
+	ext4MaxDescSize      = ext4MinBlockSize
+	ext4MinBlockSize     = 1024
+	ext4MaxBlockSize     = 65536
+
+	ext4GoodOldRevisionLevel = 0
+	ext4DynamicRevisionLevel = 1
+	ext4GoodOldFirstInode    = 11
+	ext4GoodOldInodeSize     = 128
 )
 
 // journalBackup is a backup in the superblock of the journal's inode i_block[] array and size
@@ -128,7 +139,9 @@ type superblock struct {
 	freeBlocks                   uint64
 	freeInodes                   uint32
 	firstDataBlock               uint32
+	logBlockSize                 uint32
 	blockSize                    uint32
+	logClusterSize               uint32
 	clusterSize                  uint64
 	blocksPerGroup               uint32
 	clustersPerGroup             uint32
@@ -162,7 +175,7 @@ type superblock struct {
 	journalDeviceNumber          uint32
 	orphanedInodesStart          uint32
 	hashTreeSeed                 []uint32
-	hashVersion                  hashAlgorithm
+	hashVersion                  hashVersion
 	groupDescriptorSize          uint16
 	defaultMountOptions          mountOptions
 	firstMetablockGroup          uint32
@@ -211,6 +224,10 @@ type superblock struct {
 	filenameCharsetEncodingFlags uint16
 	// inode for tracking orphaned inodes
 	orphanedInodeInodeNumber uint32
+
+	blocksCountHigh     uint32
+	rBlocksCountHigh    uint32
+	freeBlocksCountHigh uint32
 }
 
 func (sb *superblock) equal(o *superblock) bool {
@@ -267,11 +284,20 @@ func superblockFromBytes(b []byte) (*superblock, error) {
 
 	sb.freeInodes = binary.LittleEndian.Uint32(b[0x10:0x14])
 	sb.firstDataBlock = binary.LittleEndian.Uint32(b[0x14:0x18])
-	sb.blockSize = uint32(math.Exp2(float64(10 + binary.LittleEndian.Uint32(b[0x18:0x1c]))))
-	sb.clusterSize = uint64(math.Exp2(float64(binary.LittleEndian.Uint32(b[0x1c:0x20]))))
+	sb.logBlockSize = binary.LittleEndian.Uint32(b[0x18:0x1c])
+	sb.blockSize = uint32(math.Exp2(float64(10 + sb.logBlockSize)))
+	sb.logClusterSize = binary.LittleEndian.Uint32(b[0x1c:0x20])
+	if sb.features.bigalloc {
+		sb.clusterSize = uint64(math.Exp2(float64(sb.logClusterSize)))
+	} else {
+		sb.clusterSize = uint64(sb.blockSize)
+	}
+
 	sb.blocksPerGroup = binary.LittleEndian.Uint32(b[0x20:0x24])
 	if sb.features.bigalloc {
 		sb.clustersPerGroup = binary.LittleEndian.Uint32(b[0x24:0x28])
+	} else {
+		sb.clustersPerGroup = sb.blocksPerGroup
 	}
 	sb.inodesPerGroup = binary.LittleEndian.Uint32(b[0x28:0x2c])
 	// these higher bits are listed as reserved in https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout
@@ -323,17 +349,23 @@ func superblockFromBytes(b []byte) (*superblock, error) {
 	sb.lastMountedDirectory = minString(b[0x88:0xc8])
 	sb.algorithmUsageBitmap = binary.LittleEndian.Uint32(b[0xc8:0xcc])
 
-	sb.preallocationBlocks = b[0xcc]
-	sb.preallocationDirectoryBlocks = b[0xcd]
+	// should only happen
+	if sb.features.directoryPreAllocate {
+		sb.preallocationBlocks = b[0xcc]
+		sb.preallocationDirectoryBlocks = b[0xcd]
+	}
+
 	sb.reservedGDTBlocks = binary.LittleEndian.Uint16(b[0xce:0xd0])
 
-	journaluuid, err := uuid.FromBytes(b[0xd0:0xe0])
-	if err != nil {
-		return nil, fmt.Errorf("unable to read journal UUID: %v", err)
+	if sb.features.hasJournal {
+		var journalUUID uuid.UUID
+		if journalUUID, err = uuid.FromBytes(b[0xd0:0xe0]); err != nil {
+			return nil, fmt.Errorf("unable to read journal UUID: %v", err)
+		}
+		sb.journalSuperblockUUID = &journalUUID
+		sb.journalInode = binary.LittleEndian.Uint32(b[0xe0:0xe4])
+		sb.journalDeviceNumber = binary.LittleEndian.Uint32(b[0xe4:0xe8])
 	}
-	sb.journalSuperblockUUID = &journaluuid
-	sb.journalInode = binary.LittleEndian.Uint32(b[0xe0:0xe4])
-	sb.journalDeviceNumber = binary.LittleEndian.Uint32(b[0xe4:0xe8])
 	sb.orphanedInodesStart = binary.LittleEndian.Uint32(b[0xe8:0xec])
 
 	htreeSeed := make([]uint32, 0, 4)
@@ -345,9 +377,17 @@ func superblockFromBytes(b []byte) (*superblock, error) {
 	)
 	sb.hashTreeSeed = htreeSeed
 
-	sb.hashVersion = hashAlgorithm(b[0xfc])
+	sb.hashVersion = hashVersion(b[0xfc])
 
-	sb.groupDescriptorSize = binary.LittleEndian.Uint16(b[0xfe:0x100])
+	// to match https://github.com/torvalds/linux/blob/master/fs/ext4/super.c#L5131
+	if sb.features.fs64Bit {
+		sb.groupDescriptorSize = binary.LittleEndian.Uint16(b[0xfe:0x100])
+		if sb.groupDescriptorSize < ext4MinDescSize64bit || sb.groupDescriptorSize > ext4MaxDescSize || !isPowerOf2(uint64(sb.groupDescriptorSize)) {
+			return nil, fmt.Errorf("unsupported descriptor size %d", sb.groupDescriptorSize)
+		}
+	} else {
+		sb.groupDescriptorSize = ext4MinDescSize
+	}
 
 	sb.defaultMountOptions = parseMountOptions(binary.LittleEndian.Uint32(b[0x100:0x104]))
 	sb.firstMetablockGroup = binary.LittleEndian.Uint32(b[0x104:0x108])
@@ -372,6 +412,11 @@ func superblockFromBytes(b []byte) (*superblock, error) {
 		}
 	}
 
+	if sb.features.fs64Bit {
+		sb.blocksCountHigh = binary.LittleEndian.Uint32(b[0x150:0x154])
+		sb.rBlocksCountHigh = binary.LittleEndian.Uint32(b[0x154:0x158])
+		sb.freeBlocksCountHigh = binary.LittleEndian.Uint32(b[0x158:0x15c])
+	}
 	sb.inodeMinBytes = binary.LittleEndian.Uint16(b[0x15c:0x15e])
 	sb.inodeReserveBytes = binary.LittleEndian.Uint16(b[0x15e:0x160])
 	sb.miscFlags = parseMiscFlags(binary.LittleEndian.Uint32(b[0x160:0x164]))
@@ -384,9 +429,12 @@ func superblockFromBytes(b []byte) (*superblock, error) {
 
 	sb.logGroupsPerFlex = uint64(math.Exp2(float64(b[0x174])))
 
-	sb.checksumType = b[0x175] // only valid one is 1
-	if sb.checksumType != checkSumTypeCRC32c {
+	sb.checksumType = b[0x175] // only valid one is 1 (crc32c) or 0 (none - Debian)
+	if sb.checksumType != checkSumTypeCRC32c && sb.checksumType != checkSumTypeNotUsed {
 		return nil, fmt.Errorf("cannot read superblock: invalid checksum type %d, only valid is %d", sb.checksumType, checkSumTypeCRC32c)
+	}
+	if sb.checksumType == checkSumTypeNotUsed {
+		sb.features.metadataChecksums = false
 	}
 
 	// b[0x176:0x178] are reserved padding
@@ -487,7 +535,11 @@ func (sb *superblock) toBytes() ([]byte, error) {
 	binary.LittleEndian.PutUint32(b[0x10:0x14], sb.freeInodes)
 	binary.LittleEndian.PutUint32(b[0x14:0x18], sb.firstDataBlock)
 	binary.LittleEndian.PutUint32(b[0x18:0x1c], uint32(math.Log2(float64(sb.blockSize))-10))
-	binary.LittleEndian.PutUint32(b[0x1c:0x20], uint32(math.Log2(float64(sb.clusterSize))))
+	if sb.features.bigalloc {
+		binary.LittleEndian.PutUint32(b[0x1c:0x20], uint32(math.Log2(float64(sb.clusterSize))))
+	} else {
+		binary.LittleEndian.PutUint32(b[0x1c:0x20], uint32(math.Log2(float64(sb.blockSize))-10))
+	}
 
 	binary.LittleEndian.PutUint32(b[0x20:0x24], sb.blocksPerGroup)
 	if sb.features.bigalloc {
@@ -585,7 +637,10 @@ func (sb *superblock) toBytes() ([]byte, error) {
 
 	b[0xfc] = byte(sb.hashVersion)
 
-	binary.LittleEndian.PutUint16(b[0xfe:0x100], sb.groupDescriptorSize)
+	// https://github.com/torvalds/linux/blob/master/fs/ext4/super.c#L5131
+	if sb.features.fs64Bit {
+		binary.LittleEndian.PutUint16(b[0xfe:0x100], sb.groupDescriptorSize)
+	}
 
 	binary.LittleEndian.PutUint32(b[0x100:0x104], sb.defaultMountOptions.toInt())
 	binary.LittleEndian.PutUint32(b[0x104:0x108], sb.firstMetablockGroup)
@@ -765,4 +820,8 @@ func timeToBytes(t time.Time) []byte {
 	var b = make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, uint64(timestamp))
 	return b
+}
+
+func isPowerOf2(n uint64) bool {
+	return n != 0 && ((n & (n - 1)) == 0)
 }

@@ -10,12 +10,18 @@ import (
 type FileSystem interface {
 	// Type return the type of filesystem
 	Type() Type
+	// Symlink create a symbolic link from new name to old name - currently only supported in ext4 file systems
+	Symlink(oldName, newName string) error
 	// Mkdir make a directory
-	Mkdir(string) error
+	Mkdir(name string, perm os.FileMode) error
 	// ReadDir read the contents of a directory
 	ReadDir(string) ([]os.FileInfo, error)
+
+	Stat(name string) (os.FileInfo, error)
+
 	// OpenFile open a handle to read or write to a file
-	OpenFile(string, int) (File, error)
+	OpenFile(name string, flag int, perm os.FileMode) (File, error)
+
 	// Label get the label for the filesystem, or "" if none. Be careful to trim it, as it may contain
 	// leading or following whitespace. The label is passed as-is and not cleaned up at all.
 	Label() string

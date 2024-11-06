@@ -63,6 +63,11 @@ type FileSystem struct {
 	file            util.File
 }
 
+func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
 // Equal compare if two filesystems are equal
 func (fs *FileSystem) Equal(a *FileSystem) bool {
 	localMatch := fs.file == a.file && fs.dataStart == a.dataStart && fs.bytesPerCluster == a.bytesPerCluster
@@ -471,12 +476,19 @@ func (fs *FileSystem) Type() filesystem.Type {
 	return filesystem.TypeFat32
 }
 
+// Symlink creates newname as a symbolic link to oldname. On Windows, a symlink to a non-existent oldname creates a file
+// symlink; if oldname is later created as a directory the symlink will not work. If there is an error, it will be of
+// type *LinkError.- NOT SUPPORTED
+func (fs *FileSystem) Symlink(oldName string, newName string) (err error) {
+	return errors.New("not supported")
+}
+
 // Mkdir make a directory at the given path. It is equivalent to `mkdir -p`, i.e. idempotent, in that:
 //
 // * It will make the entire tree path if it does not exist
 // * It will not return an error if the path already exists
-func (fs *FileSystem) Mkdir(p string) error {
-	_, _, err := fs.readDirWithMkdir(p, true)
+func (fs *FileSystem) Mkdir(p string, perm os.FileMode) error {
+	_, _, err := fs.readDirWithMkdir(p, true, perm)
 	// we are not interesting in returning the entries
 	return err
 }
@@ -487,7 +499,7 @@ func (fs *FileSystem) Mkdir(p string) error {
 //
 // Will return an error if the directory does not exist or is a regular file and not a directory
 func (fs *FileSystem) ReadDir(p string) ([]os.FileInfo, error) {
-	_, entries, err := fs.readDirWithMkdir(p, false)
+	_, entries, err := fs.readDirWithMkdir(p, false, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error reading directory %s: %v", p, err)
 	}
@@ -527,7 +539,7 @@ func (fs *FileSystem) ReadDir(p string) ([]os.FileInfo, error) {
 // accepts normal os.OpenFile flags
 //
 // returns an error if the file does not exist
-func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
+func (fs *FileSystem) OpenFile(p string, flag int, perm os.FileMode) (filesystem.File, error) {
 	// get the path
 	dir := path.Dir(p)
 	filename := path.Base(p)
@@ -536,7 +548,7 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 		return nil, fmt.Errorf("cannot open directory %s as file", p)
 	}
 	// get the directory entries
-	parentDir, entries, err := fs.readDirWithMkdir(dir, false)
+	parentDir, entries, err := fs.readDirWithMkdir(dir, false, 0)
 	if err != nil {
 		return nil, fmt.Errorf("could not read directory entries for %s", dir)
 	}
@@ -565,7 +577,7 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 			return nil, fmt.Errorf("target file %s does not exist and was not asked to create", p)
 		}
 		// else create it
-		targetEntry, err = fs.mkFile(parentDir, filename)
+		targetEntry, err = fs.mkFile(parentDir, filename, perm)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create file %s: %v", p, err)
 		}
@@ -607,7 +619,7 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 // only stores and reads the label from the special file in the root directory.
 func (fs *FileSystem) Label() string {
 	// locate the filesystem root directory
-	_, dirEntries, err := fs.readDirWithMkdir("/", false)
+	_, dirEntries, err := fs.readDirWithMkdir("/", false, 0)
 	if err != nil {
 		return ""
 	}
@@ -651,7 +663,7 @@ func (fs *FileSystem) SetLabel(volumeLabel string) error {
 	}
 
 	// locate the filesystem root directory or create it
-	rootDir, dirEntries, err := fs.readDirWithMkdir("/", false)
+	rootDir, dirEntries, err := fs.readDirWithMkdir("/", false, 0)
 	if err != nil {
 		return fmt.Errorf("failed to locate root directory: %v", err)
 	}
@@ -788,7 +800,7 @@ func (fs *FileSystem) writeDirectoryEntries(dir *Directory) error {
 }
 
 // mkFile make a file in a directory
-func (fs *FileSystem) mkFile(parent *Directory, name string) (*directoryEntry, error) {
+func (fs *FileSystem) mkFile(parent *Directory, name string, perm os.FileMode) (*directoryEntry, error) {
 	// get a cluster chain for the file
 	clusters, err := fs.allocateSpace(1, 0)
 	if err != nil {
@@ -806,7 +818,7 @@ func (fs *FileSystem) mkLabel(parent *Directory, name string) (*directoryEntry, 
 
 // readDirWithMkdir - walks down a directory tree to the last entry
 // if it does not exist, it may or may not make it
-func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, []*directoryEntry, error) {
+func (fs *FileSystem) readDirWithMkdir(p string, doMake bool, perm os.FileMode) (*Directory, []*directoryEntry, error) {
 	paths, err := splitPath(p)
 
 	if err != nil {
