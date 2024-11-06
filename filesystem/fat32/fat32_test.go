@@ -10,10 +10,15 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	mathrandv2 "math/rand/v2"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs/disk"
 	"github.com/diskfs/go-diskfs/filesystem"
 	"github.com/diskfs/go-diskfs/filesystem/fat32"
 	"github.com/diskfs/go-diskfs/testhelper"
@@ -193,8 +198,8 @@ func TestFat32Create(t *testing.T) {
 	}
 	//nolint:thelper // this is not a helper function
 	runTest := func(t *testing.T, pre, post int64) {
-		for _, tt := range tests {
-			tt := tt
+		for _, t2 := range tests {
+			tt := t2
 			t.Run(fmt.Sprintf("blocksize %d filesize %d", tt.blocksize, tt.filesize), func(t *testing.T) {
 				// get a temporary working file
 				f, err := tmpFat32(false, pre, post)
@@ -245,8 +250,8 @@ func TestFat32Read(t *testing.T) {
 	}
 	//nolint:thelper // this is not a helper function
 	runTest := func(t *testing.T, pre, post int64) {
-		for _, tt := range tests {
-			tt := tt
+		for _, t2 := range tests {
+			tt := t2
 			t.Run(fmt.Sprintf("blocksize %d filesize %d bytechange %d", tt.filesize, tt.blocksize, tt.bytechange), func(t *testing.T) {
 				// get a temporary working file
 				f, err := tmpFat32(true, pre, post)
@@ -297,6 +302,17 @@ func TestFat32ReadDir(t *testing.T) {
 		} else {
 			fmt.Println(f.Name())
 		}
+		// determine entries from the actual data
+		rootEntries, _, err := fat32.GetValidDirectoryEntries()
+		if err != nil {
+			t.Fatalf("error getting valid directory entries: %v", err)
+		}
+		// ignore volume entry when public-facing root entries
+		rootEntries = rootEntries[:len(rootEntries)-1]
+		fooEntries, _, err := fat32.GetValidDirectoryEntriesExtended("/foo")
+		if err != nil {
+			t.Fatalf("error getting valid directory entries for /foo: %v", err)
+		}
 		tests := []struct {
 			path  string
 			count int
@@ -304,20 +320,8 @@ func TestFat32ReadDir(t *testing.T) {
 			isDir bool
 			err   error
 		}{
-			// should have 4 entries (Volume Label is not returned)
-			//   foo
-			//   TERCER~1
-			//   CORTO1.TXT
-			//   UNARCH~1.DAT
-			{"/", 4, "foo", true, nil},
-			// should have 80 entries:
-			//  dir0-75 = 76 entries
-			//  dir     =  1 entry
-			//  bar     =  1 entry
-			//    .     =  1 entry
-			//   ..     =  1 entry
-			// total = 80 entries
-			{"/foo", 80, ".", true, nil},
+			{"/", len(rootEntries), "foo", true, nil},
+			{"/foo", len(fooEntries), ".", true, nil},
 			// 0 entries because the directory does not exist
 			{"/a/b/c", 0, "", false, fmt.Errorf("error reading directory /a/b/c")},
 		}
@@ -456,8 +460,8 @@ func TestFat32OpenFile(t *testing.T) {
 				{"/CORTO1.TXT", os.O_APPEND, true, "More", "", fmt.Errorf("cannot write to file opened read-only")},
 				{"/CORTO1.TXT", os.O_APPEND | os.O_RDWR, true, "More", "Moremos un archivo corto\n", nil},
 			}
-			for _, tt := range tests {
-				tt := tt
+			for _, t2 := range tests {
+				tt := t2
 				t.Run(fmt.Sprintf("path %s mode %v beginning %v", tt.path, tt.mode, tt.beginning), func(t *testing.T) {
 					header := fmt.Sprintf("OpenFile(%s, %s, %t)", tt.path, getOpenMode(tt.mode), tt.beginning)
 					// get a temporary working file
@@ -683,13 +687,13 @@ func TestFat32OpenFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error reading fat32 filesystem from %s: %v", f.Name(), err)
 		}
-		path := "/abcdefghi"
+		p := "/abcdefghi"
 		mode := os.O_RDWR | os.O_CREATE
 		// each cluster is 512 bytes, so use 10 clusters and a bit of another
 		size := 10*512 + 22
 		bWrite := make([]byte, size)
-		header := fmt.Sprintf("OpenFile(%s, %s)", path, getOpenMode(mode))
-		readWriter, err := fs.OpenFile(path, mode)
+		header := fmt.Sprintf("OpenFile(%s, %s)", p, getOpenMode(mode))
+		readWriter, err := fs.OpenFile(p, mode)
 		switch {
 		case err != nil:
 			t.Fatalf("%s: unexpected error: %v", header, err)
@@ -714,7 +718,7 @@ func TestFat32OpenFile(t *testing.T) {
 		}
 		// and open to truncate
 		mode = os.O_RDWR | os.O_TRUNC
-		readWriter, err = fs.OpenFile(path, mode)
+		readWriter, err = fs.OpenFile(p, mode)
 		if err != nil {
 			t.Fatalf("could not reopen file: %v", err)
 		}
@@ -976,5 +980,167 @@ func TestFat32MkdirCases(t *testing.T) {
 			fmt.Printf("file: %s\n", file.Name())
 		}
 		t.Fatalf("expected 1 file, found %d", len(files))
+	}
+}
+
+func Test83Lowercase(t *testing.T) {
+	// get a temporary working file
+	f, err := tmpFat32(true, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keepTmpFiles == "" {
+		defer os.Remove(f.Name())
+	} else {
+		fmt.Println(f.Name())
+	}
+	fileInfo, err := f.Stat()
+	if err != nil {
+		t.Fatalf("error getting file info for tmpfile %s: %v", f.Name(), err)
+	}
+	fs, err := fat32.Read(f, fileInfo.Size(), 0, 512)
+	if err != nil {
+		t.Fatalf("error reading fat32 filesystem from %s: %v", f.Name(), err)
+	}
+
+	// Ensure using correct masks for lowercase shortname and extension (bits 3 and 4, zero-based)
+	files, err := fs.ReadDir("/lower83")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"lower.low", "lower.UPP", "UPPER.low"}
+	i := 0
+	for _, file := range files {
+		if file.Name() == "." || file.Name() == ".." {
+			continue
+		}
+		if file.Name() != expected[i] {
+			t.Errorf("got %q, expected %q", file.Name(), expected[i])
+		}
+		i++
+	}
+}
+
+func TestOpenFileCaseInsensitive(t *testing.T) {
+	// get a temporary working file
+	f, err := tmpFat32(true, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keepTmpFiles == "" {
+		defer os.Remove(f.Name())
+	} else {
+		fmt.Println(f.Name())
+	}
+	fileInfo, err := f.Stat()
+	if err != nil {
+		t.Fatalf("error getting file info for tmpfile %s: %v", f.Name(), err)
+	}
+	fs, err := fat32.Read(f, fileInfo.Size(), 0, 512)
+	if err != nil {
+		t.Fatalf("error reading fat32 filesystem from %s: %v", f.Name(), err)
+	}
+
+	// Ensure openfile is case-insensitive for the 8.3 name as well as the long name
+	paths := []string{
+		// The actual name
+		"/lower83/lower.low",
+		// Same name but different extension case
+		"/lower83/lower.LOW",
+		// Same name but different base case
+		"/lower83/LOWER.LOW",
+		// Actual name/case of non-8.3 file
+		"/tercer_archivo",
+		// Same name but uppercase
+		"/TERCER_ARCHIVO",
+	}
+	for _, path := range paths {
+		file, err := fs.OpenFile(path, os.O_RDONLY)
+		if err != nil {
+			t.Errorf("error opening %s: %v\n", path, err)
+		} else {
+			file.Close()
+		}
+	}
+}
+
+func testMkFile(fs filesystem.FileSystem, p string, size int) error {
+	rw, err := fs.OpenFile(p, os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return err
+	}
+	smallFile := make([]byte, size)
+	_, err = rw.Write(smallFile)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func TestCreateFileTree(t *testing.T) {
+	filename := "fat32_test"
+	tmpDir := t.TempDir()
+	tmpImgPath := filepath.Join(tmpDir, filename)
+
+	// 6GB to test large disk
+	size := int64(6 * 1024 * 1024 * 1024)
+	d, err := diskfs.Create(tmpImgPath, size, diskfs.Raw, diskfs.SectorSizeDefault)
+	if err != nil {
+		t.Fatalf("error creating disk: %v", err)
+	}
+
+	spec := disk.FilesystemSpec{
+		Partition: 0,
+		FSType:    filesystem.TypeFat32,
+	}
+	fs, err := d.CreateFilesystem(spec)
+	if err != nil {
+		t.Fatalf("error creating filesystem: %v", err)
+	}
+
+	if err := fs.Mkdir("/A"); err != nil {
+		t.Errorf("Error making dir /A in root: %v", err)
+	}
+	if err := fs.Mkdir("/b"); err != nil {
+		t.Errorf("Error making dir /b in root: %v", err)
+	}
+	if err := testMkFile(fs, "/rootfile", 11); err != nil {
+		t.Errorf("Error making microfile in root: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		dir := fmt.Sprintf("/b/sub%d", i)
+		if err := fs.Mkdir(dir); err != nil {
+			t.Errorf("Error making directory %s: %v", dir, err)
+		}
+		blobdir := path.Join(dir, "blob")
+		if err := fs.Mkdir(blobdir); err != nil {
+			t.Errorf("Error making directory %s: %v", blobdir, err)
+		}
+		file := path.Join(blobdir, "microfile")
+		if err := testMkFile(fs, file, 11); err != nil {
+			t.Errorf("Error making microfile %s: %v", file, err)
+		}
+		file = path.Join(blobdir, "randfile")
+		size := mathrandv2.IntN(73) // #nosec G404
+		if err := testMkFile(fs, file, size); err != nil {
+			t.Errorf("Error making random file %s: %v", file, err)
+		}
+		file = path.Join(blobdir, "smallfile")
+		if err := testMkFile(fs, file, 5*1024*1024); err != nil {
+			t.Errorf("Error making small file %s: %v", file, err)
+		}
+	}
+	file := "/b/sub49/blob/gigfile1"
+	gb := 1024 * 1024 * 1024
+	if err := testMkFile(fs, file, gb); err != nil {
+		t.Errorf("Error making gigfile1 %s: %v", file, err)
+	}
+	file = "/b/sub50/blob/gigfile1"
+	if err := testMkFile(fs, file, gb); err != nil {
+		t.Errorf("Error making gigfile1 %s: %v", file, err)
+	}
+	file = "/b/sub51/blob/gigfile1"
+	if err := testMkFile(fs, file, gb); err != nil {
+		t.Errorf("Error making gigfile1 %s: %v", file, err)
 	}
 }
