@@ -118,9 +118,11 @@ func (fl *File) Read(b []byte) (int, error) {
 // use Seek() to set at a particular point
 func (fl *File) Write(b []byte) (int, error) {
 	var (
-		fileSize   = int64(fl.size)
-		blockCount = fl.blocks
-		blocksize  = uint64(fl.filesystem.superblock.blockSize)
+		err                error
+		written            int
+		existingFileSize   = int64(fl.size)
+		existingBlockCount = fl.blocks
+		blockSize          = uint64(fl.filesystem.superblock.blockSize)
 	)
 	if !fl.isReadWrite && !fl.isWriteOnly && !fl.isAppend {
 		return 0, fmt.Errorf("file is not open for writing")
@@ -128,51 +130,44 @@ func (fl *File) Write(b []byte) (int, error) {
 
 	// if appending keep existing bytes and set the offset to the end of the file
 	// else truncate the size to the current offset. This will be zero on first write
-	if fl.directoryEntry.fileType == dirFileTypeRegular {
-		if fl.isAppend {
-			fl.offsetWrite = int64(fl.size)
-		} else {
-			fileSize = fl.offsetWrite
-		}
+	switch fl.directoryEntry.fileType {
+	case dirFileTypeDirectory:
+	case dirFileTypeRegular:
+	default:
+		return 0, fmt.Errorf("expecting: %d, received: %d", dirFileTypeRegular, fl.directoryEntry.fileType)
 	}
 
 	// if adding these bytes goes past the filesize, update the inode filesize to the new size and write the inode
 	// if adding these bytes goes past the total number of blocks, add more blocks, update the inode block count and write the inode
 	// if the offset is greater than the filesize, update the inode filesize to the offset
-	if fl.offsetWrite >= fileSize {
-		fl.size = uint64(fl.offsetWrite)
-	}
 
 	// Calculate the number of bytes to write
 	bytesToWrite := int64(len(b))
 
-	offsetAfterWrite := fl.offsetWrite + bytesToWrite
-	if offsetAfterWrite > fileSize {
-		fl.size = uint64(fl.offsetWrite + bytesToWrite)
-	}
+	// calculate the new size of the file
+	fl.size = uint64(fl.offsetWrite + bytesToWrite)
 
 	// calculate the number of blocks in the file post-write
-	fl.blocks = fl.size / blocksize
-	if fl.size%blocksize > 0 {
+	fl.blocks = fl.size / blockSize
+	if fl.size%blockSize > 0 {
 		fl.blocks++
 	}
-	if fl.blocks > blockCount {
+	if fl.blocks > existingBlockCount {
 		// determine the number of leaf and internal node blocks needed
-
+		existing := len(fl.extents)
 		// allocateExtents removes existing extents blocks from the bytes needed internally
-		newExtents, err := fl.filesystem.allocateExtents(fl.blocks*blocksize, &fl.extents)
-		if err != nil {
+		if err = fl.filesystem.allocateExtents(fl.blocks*blockSize, &fl.extents); err != nil {
 			return 0, fmt.Errorf("could not allocate disk space for file %w", err)
 		}
-		fl.inode.extents, err = extendExtentTree(fl.inode.extents, newExtents, fl.filesystem, nil)
-		if err != nil {
-			return 0, fmt.Errorf("could not convert extents into tree: %w", err)
+		if existing < len(fl.extents) {
+			if fl.inode.extents, err = extendExtentTree(fl.inode.extents, fl.extents[existing:], fl.filesystem, nil); err != nil {
+				return 0, fmt.Errorf("could not convert extents into tree: %w", err)
+			}
 		}
 	}
 
-	if fileSize != int64(fl.size) || blockCount != fl.blocks {
-		err := fl.filesystem.writeInode(fl.inode)
-		if err != nil {
+	if existingFileSize != int64(fl.size) || existingBlockCount != fl.blocks {
+		if err = fl.filesystem.writeInode(fl.inode); err != nil {
 			return 0, fmt.Errorf("could not write inode: %w", err)
 		}
 	}
@@ -181,16 +176,16 @@ func (fl *File) Write(b []byte) (int, error) {
 
 	// the offset given for reading is relative to the file, so we need to calculate
 	// where these are in the extents relative to the file
-	writeStartBlock := uint64(fl.offsetWrite) / blocksize
+	writeStartBlock := uint64(fl.offsetWrite) / blockSize
 	for _, e := range fl.extents {
 		// if the last block of the extent is before the first block we want to write, skip it
 		if uint64(e.fileBlock)+uint64(e.count) <= writeStartBlock {
 			continue
 		}
 		// extentSize is the number of bytes on the disk for the extent
-		extentSize := int64(e.count) * int64(blocksize)
+		extentSize := int64(e.count) * int64(blockSize)
 		// where do we start and end in the extent?
-		startPositionInExtent := fl.offsetWrite - int64(e.fileBlock)*int64(blocksize)
+		startPositionInExtent := fl.offsetWrite - int64(e.fileBlock)*int64(blockSize)
 		leftInExtent := extentSize - startPositionInExtent
 		// how many bytes are left in the extent?
 		toWriteInOffset := bytesToWrite - writtenBytes
@@ -198,9 +193,8 @@ func (fl *File) Write(b []byte) (int, error) {
 			toWriteInOffset = leftInExtent
 		}
 		// read those bytes
-		startPosOnDisk := e.startingBlock*blocksize + uint64(startPositionInExtent) + uint64(fl.filesystem.start)
-		written, err := fl.filesystem.file.WriteAt(b[writtenBytes:writtenBytes+toWriteInOffset], int64(startPosOnDisk))
-		if err != nil {
+		startPosOnDisk := e.startingBlock*blockSize + uint64(startPositionInExtent) + uint64(fl.filesystem.start)
+		if written, err = fl.filesystem.file.WriteAt(b[writtenBytes:writtenBytes+toWriteInOffset], int64(startPosOnDisk)); err != nil {
 			return int(writtenBytes), fmt.Errorf("failed to write bytes: %v", err)
 		}
 		writtenBytes += int64(written)

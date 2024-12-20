@@ -932,19 +932,22 @@ func (fs *FileSystem) Rename(from, to string) error {
 
 	parentEntriesSizeTo := parentDirTo.entries.Size()
 	if required := blocksRequired(parentEntriesSizeTo, fs.superblock.blockSize); required > parentBlocksTo {
-		var (
-			parentExtentsExisting extents
-			parentExtendsNew      *extents
-		)
+		var parentExtentsExisting extents
 		if parentExtentsExisting, err = parentInodeTo.extents.blocks(fs); err != nil {
 			return err
 		}
+		existing := len(parentExtentsExisting)
+
 		// allocateExtends removes existing extents blocks from the bytes needed internally
-		if parentExtendsNew, err = fs.allocateExtents(uint64(required*fs.superblock.blockSize), &parentExtentsExisting); err != nil {
+		if err = fs.allocateExtents(uint64(required*fs.superblock.blockSize), &parentExtentsExisting); err != nil {
 			return fmt.Errorf("could not allocate disk space for file %w", err)
 		}
-		if parentInodeTo.extents, err = extendExtentTree(parentInodeTo.extents, parentExtendsNew, fs, nil); err != nil {
-			return fmt.Errorf("could not convert extents into tree: %w", err)
+
+		// if new extends were allocated, extend the tree
+		if existing < len(parentExtentsExisting) {
+			if parentInodeTo.extents, err = extendExtentTree(parentInodeTo.extents, parentExtentsExisting[existing:], fs, nil); err != nil {
+				return fmt.Errorf("could not convert extents into tree: %w", err)
+			}
 		}
 	}
 
@@ -1149,18 +1152,18 @@ func (fs *FileSystem) Truncate(p string, size int64) error {
 		return fmt.Errorf("cannot truncate directory %s", p)
 	}
 	// it is not a directory, and it exists, so truncate it
-	inode, err := fs.readInode(entry.inode)
+	ino, err := fs.readInode(entry.inode)
 	if err != nil {
 		return fmt.Errorf("could not read inode %d in directory: %v", entry.inode, err)
 	}
 	// change the file size
-	inode.size = uint64(size)
+	ino.size = uint64(size)
 
 	// free used blocks if shrank, or reserve new blocks if grew
 	// both of which mean updating the superblock, and the extents tree in the inode
 
 	// write the inode back
-	return fs.writeInode(inode)
+	return fs.writeInode(ino)
 }
 
 // getEntryAndParent given a path, get the Directory for the parent and the directory entry for the file.
@@ -1527,7 +1530,7 @@ func (fs *FileSystem) mkDirEntry(parent *Directory, name string, linkTarget stri
 		contentSize      uint64
 		hardLinks        uint16
 		blockCount       uint64
-		newExtents       *extents
+		newExtents       extents
 		extentTreeParsed extentBlockFinder
 		flags            inodeFlags
 	)
@@ -1596,10 +1599,11 @@ func (fs *FileSystem) mkDirEntry(parent *Directory, name string, linkTarget stri
 		return nil, fmt.Errorf("could not allocate inode for file %s: %w", name, err)
 	}
 	// get extents for the file - prefer in the same block group as the inode, if possible
-	if newExtents, err = fs.allocateExtents(size, nil); err != nil {
+	newExtents = make([]extent, 0)
+	if err = fs.allocateExtents(size, &newExtents); err != nil {
 		return nil, fmt.Errorf("could not allocate disk space for file %s: %w", name, err)
 	}
-	if newExtents != nil {
+	if len(newExtents) > 0 {
 		flags.usesExtents = true
 		blockCount = newExtents.blockCount()
 		if extentTreeParsed, err = extendExtentTree(nil, newExtents, fs, nil); err != nil {
@@ -1624,19 +1628,20 @@ func (fs *FileSystem) mkDirEntry(parent *Directory, name string, linkTarget stri
 
 	parentEntriesSize := parent.entries.Size()
 	if required := blocksRequired(parentEntriesSize, fs.superblock.blockSize); required > parentBlocks {
-		var (
-			parentExtentsExisting extents
-			parentExtendsNew      *extents
-		)
+		var parentExtentsExisting extents
 		if parentExtentsExisting, err = parentInode.extents.blocks(fs); err != nil {
 			return nil, err
 		}
+
+		existing := len(parentExtentsExisting)
 		// allocateExtends removes existing extents blocks from the bytes needed internally
-		if parentExtendsNew, err = fs.allocateExtents(uint64(required*fs.superblock.blockSize), &parentExtentsExisting); err != nil {
+		if err = fs.allocateExtents(uint64(required*fs.superblock.blockSize), &parentExtentsExisting); err != nil {
 			return nil, fmt.Errorf("could not allocate disk space for file %w", err)
 		}
-		if parentInode.extents, err = extendExtentTree(parentInode.extents, parentExtendsNew, fs, nil); err != nil {
-			return nil, fmt.Errorf("could not convert extents into tree: %w", err)
+		if existing < len(parentExtentsExisting) {
+			if parentInode.extents, err = extendExtentTree(parentInode.extents, parentExtentsExisting[existing:], fs, nil); err != nil {
+				return nil, fmt.Errorf("could not convert extents into tree: %w", err)
+			}
 		}
 	}
 
@@ -1856,27 +1861,31 @@ func printFile(fs *FileSystem, prefix string, from int64, length int) {
 // arguments are file size in bytes and existing extents
 // if previous is nil, then we are not (re)sizing an existing file but creating a new one
 // returns the extents to be used in order
-func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents, error) {
+func (fs *FileSystem) allocateExtents(size uint64, previous *extents) error {
+	if previous == nil {
+		return errors.New("expected previous set of extents, recevied: nil")
+	}
 	// 1- calculate how many blocks are needed
 	required := size / uint64(fs.superblock.blockSize)
 	if size%uint64(fs.superblock.blockSize) > 0 {
 		required++
 	}
 	// 2- see how many blocks already are allocated
-	var allocated uint64
-	if previous != nil {
-		allocated = previous.blockCount()
-	}
+	allocated := previous.blockCount()
+
 	// 3- if needed, allocate new blocks in extents
-	extraBlockCount := required - allocated
+
 	// if we have enough, do not add anything
-	if extraBlockCount <= 0 {
-		return previous, nil
+	if allocated >= required {
+		return nil
 	}
+
+	// do this after the condition since these are unsigned integers
+	extraBlockCount := required - allocated
 
 	// if there are not enough blocks left on the filesystem, return an error
 	if fs.superblock.freeBlocks < extraBlockCount {
-		return nil, fmt.Errorf("only %d blocks free, requires additional %d", fs.superblock.freeBlocks, extraBlockCount)
+		return fmt.Errorf("only %d blocks free, requires additional %d", fs.superblock.freeBlocks, extraBlockCount)
 	}
 
 	// now we need to look for as many contiguous blocks as possible
@@ -1909,11 +1918,11 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 		// 3- find the maximum contiguous space available
 		bs, err := fs.readBlockBitmap(int(i))
 		if err != nil {
-			return nil, fmt.Errorf("could not read block bitmap for block group %d: %v", i, err)
+			return fmt.Errorf("could not read block bitmap for block group %d: %v", i, err)
 		}
 		// now find our unused blocks and how many there are in a row as potential extents
 		if extraBlockCount > maxUint16 {
-			return nil, fmt.Errorf("cannot allocate more than %d blocks in a single extent", maxUint16)
+			return fmt.Errorf("cannot allocate more than %d blocks in a single extent", maxUint16)
 		}
 
 		// get the list of free blocks
@@ -1938,10 +1947,8 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 		})
 
 		// TODO: growing internal nodes are not supported yet, try to find three extents that can hold the data
-		maxExtents := 4
-		if previous != nil {
-			maxExtents -= len(*previous)
-		}
+		maxExtents := 4 - len(*previous)
+
 		if len(exts) > maxExtents {
 			exts = exts[:maxExtents]
 		}
@@ -1970,7 +1977,7 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 				// the extent lists the absolute block number, but the bitmap is relative to the block group
 				blockInGroup := block - uint64(i)*uint64(blocksPerGroup)
 				if err = bs.Set(int(blockInGroup)); err != nil {
-					return nil, fmt.Errorf("could not clear block bitmap for block %d: %v", i, err)
+					return fmt.Errorf("could not clear block bitmap for block %d: %v", i, err)
 				}
 			}
 
@@ -1981,15 +1988,13 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 		}
 	}
 	if extraBlockCount-allocatedBlocks > 0 {
-		return nil, fmt.Errorf("could not allocate %d blocks", extraBlockCount)
+		return fmt.Errorf("could not allocate %d blocks", extraBlockCount)
 	}
 
 	// update the fileBlock for the new extends
 	current := uint32(0)
-	if previous != nil {
-		if prev := *previous; len(prev) > 0 {
-			current = prev[len(prev)-1].fileBlock + uint32(prev[len(prev)-1].count)
-		}
+	if prev := *previous; len(prev) > 0 {
+		current = prev[len(prev)-1].fileBlock + uint32(prev[len(prev)-1].count)
 	}
 	for j := range newExtents {
 		newExtents[j].fileBlock = current
@@ -1999,14 +2004,14 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 	// write the block bitmaps back to disk
 	for bg, bs := range dataBlockBitmaps {
 		if err := fs.writeBlockBitmap(bs, bg); err != nil {
-			return nil, fmt.Errorf("could not write block bitmap for block group %d: %v", bg, err)
+			return fmt.Errorf("could not write block bitmap for block group %d: %v", bg, err)
 		}
 
 		gd := fs.groupDescriptors.descriptors[bg]
 		gd.freeBlocks -= uint32(usedBlocks[bg])
 		// write the group descriptor back
 		if err := fs.writeGroupDescriptor(gd); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -2014,19 +2019,14 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 	// fix: only remove the number of new blocks created not fs.superblock.freeBlocks -= allocated
 	fs.superblock.freeBlocks -= extraBlockCount
 	// update the blockBitmapChecksum for any updated block groups in GDT
-	// write updated superblock and GDT to disk
+	// write updated super block and GDT to disk
 	if err := fs.writeSuperblock(); err != nil {
-		return nil, fmt.Errorf("could not write superblock: %w", err)
+		return fmt.Errorf("could not write superblock: %w", err)
 	}
 
 	// update the previous
-	if previous != nil {
-		*previous = append(*previous, newExtents...)
-	}
-
-	// write backup copies
-	var exten extents = newExtents
-	return &exten, nil
+	*previous = append(*previous, newExtents...)
+	return nil
 }
 
 func (fs *FileSystem) getCheckSumSeed(sb *superblock) uint32 {

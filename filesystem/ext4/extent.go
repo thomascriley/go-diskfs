@@ -380,7 +380,7 @@ func parseExtents(b []byte, blockSize, start, count uint32) (extentBlockFinder, 
 // For example, if the input is an extent tree - like the kind found in an inode - and you want to add more extents to it,
 // you add the provided extents, and it expands the tree, including creating new internal nodes and writing them to disk, as needed.
 
-func extendExtentTree(existing extentBlockFinder, added *extents, fs *FileSystem, parent *extentInternalNode) (extentBlockFinder, error) {
+func extendExtentTree(existing extentBlockFinder, added extents, fs *FileSystem, parent *extentInternalNode) (extentBlockFinder, error) {
 	// Check if existing is a leaf or internal node
 	switch node := existing.(type) {
 	case *extentLeafNode:
@@ -395,17 +395,17 @@ func extendExtentTree(existing extentBlockFinder, added *extents, fs *FileSystem
 	}
 }
 
-func createRootExtentTree(added *extents, fs *FileSystem) (extentBlockFinder, error) {
+func createRootExtentTree(added extents, fs *FileSystem) (extentBlockFinder, error) {
 	// the root always is in the inode, which has a maximum of 4 extents. If it fits within that, we can just create a leaf node.
-	if len(*added) <= 4 {
+	if len(added) <= 4 {
 		return &extentLeafNode{
 			extentNodeHeader: extentNodeHeader{
 				depth:     0,
-				entries:   uint16(len(*added)),
+				entries:   uint16(len(added)),
 				max:       4,
 				blockSize: fs.superblock.blockSize,
 			},
-			extents: *added,
+			extents: added,
 		}, nil
 	}
 	// in theory, we never should be creating a root internal node. We always should be starting with an extent or two,
@@ -414,11 +414,11 @@ func createRootExtentTree(added *extents, fs *FileSystem) (extentBlockFinder, er
 	return nil, fmt.Errorf("cannot create root internal node")
 }
 
-func extendLeafNode(node *extentLeafNode, added *extents, fs *FileSystem, parent *extentInternalNode) (extentBlockFinder, error) {
+func extendLeafNode(node *extentLeafNode, added extents, fs *FileSystem, parent *extentInternalNode) (extentBlockFinder, error) {
 	// Check if the leaf node has enough space for the added extents
-	if len(node.extents)+len(*added) <= int(node.max) {
+	if len(node.extents)+len(added) <= int(node.max) {
 		// Simply append the extents if there's enough space
-		node.extents = append(node.extents, *added...)
+		node.extents = append(node.extents, added...)
 		node.entries = uint16(len(node.extents))
 
 		// Write the updated node back to the disk
@@ -455,10 +455,10 @@ func extendLeafNode(node *extentLeafNode, added *extents, fs *FileSystem, parent
 	return extendInternalNode(parentNode, added, fs, parent)
 }
 
-func splitLeafNode(node *extentLeafNode, added *extents, fs *FileSystem, parent *extentInternalNode) ([]*extentLeafNode, error) {
+func splitLeafNode(node *extentLeafNode, added extents, fs *FileSystem, parent *extentInternalNode) ([]*extentLeafNode, error) {
 	// Combine existing and new extents
 	allExtents := node.extents
-	allExtents = append(allExtents, *added...)
+	allExtents = append(allExtents, added...)
 	// Sort extents by fileBlock to maintain order
 	sort.Slice(allExtents, func(i, j int) bool {
 		return allExtents[i].fileBlock < allExtents[j].fileBlock
@@ -576,7 +576,7 @@ func childPtrMatchesNode(childPtr *extentChildPtr, node extentBlockFinder) bool 
 	}
 }
 
-func extendInternalNode(node *extentInternalNode, added *extents, fs *FileSystem, parent *extentInternalNode) (extentBlockFinder, error) {
+func extendInternalNode(node *extentInternalNode, added extents, fs *FileSystem, parent *extentInternalNode) (extentBlockFinder, error) {
 	// Find the appropriate child node to extend
 	childIndex := findChildNode(node, added)
 	childPtr := node.children[childIndex]
@@ -744,11 +744,10 @@ func findChildBlockNumber(parent *extentInternalNode, child extentBlockFinder) u
 	return 0
 }
 
-func findChildNode(node *extentInternalNode, added *extents) int {
+func findChildNode(node *extentInternalNode, added extents) int {
 	// Assuming added extents are sorted, find the correct child node to extend
-	addedSlice := *added
 	for i, child := range node.children {
-		if addedSlice[0].fileBlock < child.fileBlock {
+		if added[0].fileBlock < child.fileBlock {
 			return i - 1
 		}
 	}
