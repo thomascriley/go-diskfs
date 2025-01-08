@@ -83,17 +83,17 @@ func (d *directoryHashNode) AddEntry(entry *directoryEntry) {
 	// blocks are calculated during serialization for new entries
 
 	hash := d.entryHash(entry)
-	added := false
+	//added := false
 	for i := range d.hashEntries {
-		fmt.Printf("Hash: %d -> %d : %d\n", d.hashEntries[i].hash, d.hashEntries[i+1].hash, hash)
+		//fmt.Printf("Hash: %d -> %d : %d\n", d.hashEntries[i].hash, d.hashEntries[i+1].hash, hash)
 		if !(hash >= d.hashEntries[i].hash && (i == len(d.hashEntries)-1 || hash < d.hashEntries[i+1].hash)) {
 			continue
 		}
-		fmt.Println("adding entry")
+		//fmt.Println("adding entry")
 		blocks := blocksRequired(d.nodes[i].Size(), d.bytesPerBlock)
 		d.nodes[i].AddEntry(entry)
 		d.entries = append(d.entries, entry)
-		added = true
+		//added = true
 		if blocks != blocksRequired(d.nodes[i].Size(), d.bytesPerBlock) {
 			if linear, ok := d.nodes[i].(*directoryEntriesLinear); ok {
 				half := len(linear.entries) / 2
@@ -113,9 +113,9 @@ func (d *directoryHashNode) AddEntry(entry *directoryEntry) {
 		}
 		break
 	}
-	if !added {
-		fmt.Println("did not add entry!")
-	}
+	//if !added {
+	//	fmt.Println("did not add entry!")
+	//}
 }
 
 func (d *directoryHashNode) RemoveEntry(entry *directoryEntry) {
