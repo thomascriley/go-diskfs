@@ -5,13 +5,16 @@ import (
 	"os"
 
 	"golang.org/x/sys/unix"
+	"syscall"
+	"unsafe"
 )
 
 // getBlockDeviceSize get the size of an opened block device in Bytes.
 func getBlockDeviceSize(f *os.File) (int64, error) {
-	blockDeviceSize, err := unix.IoctlGetInt(int(f.Fd()), unix.BLKGETSIZE64)
-	if err != nil {
-		return 0, fmt.Errorf("unable to get block device size: %v", err)
+	//blockDeviceSize, err := unix.IoctlGetInt(int(f.Fd()), unix.BLKGETSIZE64)
+	var blockDeviceSize uint64
+	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), unix.BLKGETSIZE64, uintptr(unsafe.Pointer(&blockDeviceSize))); err != 0 {
+		return 0, os.NewSyscallError("ioctl: BLKGETSIZE64", err)
 	}
 	return int64(blockDeviceSize), nil
 }

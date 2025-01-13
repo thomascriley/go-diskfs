@@ -602,6 +602,82 @@ func Create(f util.File, size, start, sectorsize int64, p *Params) (*FileSystem,
 	}, nil
 }
 
+/*
+func (fs *FileSystem) Resize(size int64) error {
+	if fs.size > size {
+		return fmt.Errorf("existing size %d < new size %d: can not shrink filesyste)", fs.size, size)
+	}
+	if fs.size == size {
+		return nil
+	}
+
+	numBlocks := size / int64(fs.superblock.blockSize)
+
+	// how many block groups do we have?
+	blockGroups := numBlocks / int64(fs.superblock.blocksPerGroup)
+
+	// use our inode ratio to determine how many inodes we should have
+	inodeRatio := DefaultInodeRatio
+	if inodeRatio < int64(fs.superblock.blockSize) {
+		inodeRatio = int64(fs.superblock.blockSize)
+	}
+
+	// calculate how many inodes are needed
+	inodeCount64 := (numBlocks * int64(fs.superblock.blockSize)) / inodeRatio
+	if uint64(inodeCount64) > max32Num {
+		return fmt.Errorf("requested %d inodes, greater than max %d", inodeCount64, max32Num)
+	}
+
+	inodesPerGroup := inodeCount64 / blockGroups
+
+	fs.size = size
+	fs.blockGroups = blockGroups
+	fs.superblock.freeBlocks = uint64(numBlocks) - fs.superblock.blockCount + fs.superblock.freeBlocks
+	fs.superblock.freeInodes = uint32(inodeCount64) - fs.superblock.inodeCount + fs.superblock.freeInodes
+	fs.superblock.blockCount = uint64(numBlocks)
+	fs.superblock.inodeCount = uint32(inodeCount64)
+	fs.superblock.inodesPerGroup = uint32(inodesPerGroup)
+
+	// how big should the GDT be?
+	gdSize := groupDescriptorSize
+	if fs.superblock.features.fs64Bit {
+		gdSize = groupDescriptorSize64Bit
+	}
+	gdtSize := int64(gdSize) * numBlocks
+
+	// write the superblock and GDT to the various locations on disk
+	for _, bg := range backupSuperblocks {
+		block := bg * int64(fs.superblock.blocksPerGroup)
+		blockStart := block * int64(fs.superblock.blockSize)
+		// allow that the first one requires an offset
+		incr := int64(0)
+		if block == 0 {
+			incr = int64(SectorSize512) * 2
+		}
+
+		// write the superblock
+		count, err := f.WriteAt(b, incr+blockStart+start)
+		if err != nil {
+			return nil, fmt.Errorf("error writing Superblock for block %d to disk: %v", block, err)
+		}
+		if count != int(SuperblockSize) {
+			return nil, fmt.Errorf("wrote %d bytes of Superblock for block %d to disk instead of expected %d", count, block, SuperblockSize)
+		}
+
+		// write the GDT
+		count, err = f.WriteAt(g, incr+blockStart+int64(SuperblockSize)+start)
+		if err != nil {
+			return nil, fmt.Errorf("error writing GDT for block %d to disk: %v", block, err)
+		}
+		if count != int(gdtSize) {
+			return nil, fmt.Errorf("wrote %d bytes of GDT for block %d to disk instead of expected %d", count, block, gdtSize)
+		}
+	}
+
+	return nil
+}
+*/
+
 // Read reads a filesystem from a given disk.
 //
 // requires the util.File where to read the filesystem, size is the size of the filesystem in bytes,
