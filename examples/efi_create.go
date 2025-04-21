@@ -47,8 +47,8 @@ func CreateEfi(diskImg string) {
 	fs, err := disk.CreateFilesystem(spec)
 
 	// make our directories
-	err = fs.Mkdir("/EFI/BOOT")
-	rw, err := fs.OpenFile("/EFI/BOOT/BOOTX64.EFI", os.O_CREATE|os.O_RDWR)
+	err = fs.Mkdir("/EFI/BOOT", 0755)
+	rw, err := fs.OpenFile("/EFI/BOOT/BOOTX64.EFI", os.O_CREATE|os.O_RDWR, 0666)
 
 	n, err := rw.Write(kernel)
 	if err != nil {

@@ -22,7 +22,7 @@ func CreateSquashfs(diskImg string) {
 	fspec := disk.FilesystemSpec{Partition: 0, FSType: filesystem.TypeSquashfs, VolumeLabel: "label"}
 	fs, err := mydisk.CreateFilesystem(fspec)
 	check(err)
-	rw, err := fs.OpenFile("demo.txt", os.O_CREATE|os.O_RDWR)
+	rw, err := fs.OpenFile("demo.txt", os.O_CREATE|os.O_RDWR, 0666)
 	content := []byte("demo")
 	_, err = rw.Write(content)
 	check(err)

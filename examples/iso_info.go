@@ -42,7 +42,7 @@ func fileInfoFor(path string, fs filesystem.FileSystem) error {
 			}
 			continue
 		}
-		isoFile, err := fs.OpenFile(fullPath, os.O_RDONLY)
+		isoFile, err := fs.OpenFile(fullPath, os.O_RDONLY, 0666)
 		if err != nil {
 			fmt.Printf("Failed to open file %s: %v\n", fullPath, err)
 			continue

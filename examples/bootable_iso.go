@@ -26,7 +26,7 @@ func CreateBootableIso(diskImg string) {
 	fs, err := mydisk.CreateFilesystem(fspec)
 	check(err)
 	// write contents to the disk
-	rw, err := fs.OpenFile("demo.txt", os.O_CREATE|os.O_RDWR)
+	rw, err := fs.OpenFile("demo.txt", os.O_CREATE|os.O_RDWR, 0666)
 	check(err)
 	content := []byte("demo")
 	_, err = rw.Write(content)

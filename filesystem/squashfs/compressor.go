@@ -8,7 +8,7 @@ import (
 	"io"
 
 	"github.com/klauspost/compress/zstd"
-	lz4 "github.com/pierrec/lz4/v4"
+	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
 	"github.com/ulikunitz/xz/lzma"
 )
@@ -171,17 +171,16 @@ type CompressorXz struct {
 
 func (c *CompressorXz) compress(in []byte) ([]byte, error) {
 	var b bytes.Buffer
-	config := xz.WriterConfig{
-		DictCap: int(c.DictionarySize),
-	}
-	xzWriter, err := config.NewWriter(&b)
+	xzWriter, err := xz.NewWriterConfig(&b, xz.WriterConfig{
+		Workers: 2,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("error creating xz compressor: %v", err)
 	}
-	if _, err := xzWriter.Write(in); err != nil {
+	if _, err = xzWriter.Write(in); err != nil {
 		return nil, err
 	}
-	if err := xzWriter.Close(); err != nil {
+	if err = xzWriter.Close(); err != nil {
 		return nil, err
 	}
 	return b.Bytes(), nil
