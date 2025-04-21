@@ -1,6 +1,8 @@
 module github.com/diskfs/go-diskfs
 
-go 1.22
+go 1.23.0
+
+toolchain go1.23.4
 
 require (
 	github.com/djherbis/times v1.6.0
@@ -11,10 +13,10 @@ require (
 	github.com/pkg/xattr v0.4.10
 	github.com/sirupsen/logrus v1.9.4-0.20230606125235-dd1b4c2e81af
 	github.com/ulikunitz/xz v0.5.12
-	golang.org/x/sys v0.29.0
+	golang.org/x/sys v0.32.0
 )
 
 require (
-	github.com/google/go-cmp v0.6.0
-	github.com/klauspost/compress v1.17.11
+	github.com/google/go-cmp v0.7.0
+	github.com/klauspost/compress v1.18.0
 )
