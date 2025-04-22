@@ -9,8 +9,6 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
-	"github.com/ulikunitz/xz"
-	"github.com/ulikunitz/xz/lzma"
 )
 
 // Compressor defines a compressor. Fulfilled by various implementations in this package
@@ -24,33 +22,6 @@ type Compressor interface {
 
 // CompressorLzma lzma compression
 type CompressorLzma struct {
-}
-
-func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
-	var b bytes.Buffer
-	lz, err := lzma.NewWriter(&b)
-	if err != nil {
-		return nil, fmt.Errorf("error creating lzma compressor: %v", err)
-	}
-	if _, err := lz.Write(in); err != nil {
-		return nil, err
-	}
-	if err := lz.Close(); err != nil {
-		return nil, err
-	}
-	return b.Bytes(), nil
-}
-func (c *CompressorLzma) decompress(in []byte) ([]byte, error) {
-	b := bytes.NewReader(in)
-	lz, err := lzma.NewReader(b)
-	if err != nil {
-		return nil, fmt.Errorf("error creating lzma decompressor: %v", err)
-	}
-	p, err := io.ReadAll(lz)
-	if err != nil {
-		return nil, fmt.Errorf("error decompressing: %v", err)
-	}
-	return p, nil
 }
 
 //nolint:unused,revive // it is important to implement the interface
@@ -169,34 +140,6 @@ type CompressorXz struct {
 	ExecutableFilters map[XzFilter]bool
 }
 
-func (c *CompressorXz) compress(in []byte) ([]byte, error) {
-	var b bytes.Buffer
-	xzWriter, err := xz.NewWriterConfig(&b, xz.WriterConfig{
-		Workers: 2,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error creating xz compressor: %v", err)
-	}
-	if _, err = xzWriter.Write(in); err != nil {
-		return nil, err
-	}
-	if err = xzWriter.Close(); err != nil {
-		return nil, err
-	}
-	return b.Bytes(), nil
-}
-func (c *CompressorXz) decompress(in []byte) ([]byte, error) {
-	b := bytes.NewReader(in)
-	xzReader, err := xz.NewReader(b)
-	if err != nil {
-		return nil, fmt.Errorf("error creating xz decompressor: %v", err)
-	}
-	p, err := io.ReadAll(xzReader)
-	if err != nil {
-		return nil, fmt.Errorf("error decompressing: %v", err)
-	}
-	return p, nil
-}
 func (c *CompressorXz) loadOptions(b []byte) error {
 	expected := 8
 	if len(b) != expected {
